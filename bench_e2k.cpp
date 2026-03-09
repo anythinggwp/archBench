@@ -75,7 +75,7 @@ BENCHMARK_DEFINE_F(Fixture, MatrixAdd)(benchmark::State &state)
     {
         for (size_t i = 0; i < M; ++i)
         {
-            eml_Vector_Mul_64F(C_add1[0], A[0], B[0], M);
+            eml_Vector_Mul_64F(C_add1, A, B, M);
         }
 
         benchmark::DoNotOptimize(C_add1.data());
