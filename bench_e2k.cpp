@@ -4,7 +4,7 @@
 #include <vector>
 #include <random>
 #include <algorithm>
-#include <eml.h>
+#include <eml/eml.h>
 
 struct Fixture : public benchmark::Fixture
 {
