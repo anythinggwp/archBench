@@ -78,7 +78,7 @@ BENCHMARK_DEFINE_F(Fixture, MatrixAdd)(benchmark::State &state)
         }
 
         benchmark::DoNotOptimize(C.data());
-        benchmark::ClobberMemory();
+        // benchmark::ClobberMemory();
     }
 
     state.SetItemsProcessed(int64_t(state.iterations()) * M);
@@ -130,7 +130,7 @@ BENCHMARK_DEFINE_F(Fixture, MatrixTranspose)(benchmark::State &state)
         }
 
         benchmark::DoNotOptimize(C.data());
-        benchmark::ClobberMemory();
+        // benchmark::ClobberMemory();
     }
 
     state.SetItemsProcessed(int64_t(state.iterations()) * N * N);
@@ -164,7 +164,7 @@ BENCHMARK_DEFINE_F(Fixture, MatrixMultiply)(benchmark::State &state)
         }
 
         benchmark::DoNotOptimize(C.data());
-        benchmark::ClobberMemory();
+        // benchmark::ClobberMemory();
     }
 
     // количество обработанных элементов
