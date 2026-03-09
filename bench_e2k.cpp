@@ -69,15 +69,15 @@ struct Fixture : public benchmark::Fixture
 BENCHMARK_DEFINE_F(Fixture, MatrixAdd)(benchmark::State &state)
 {
     size_t M = matrix_size * matrix_size;
-
+    std::vector<double> C_add1(M); // отдельный буфер для этого теста
     for (auto _ : state)
     {
         for (size_t i = 0; i < M; ++i)
         {
-            C[i] = A[i] + B[i];
+            C_add1[i] = A[i] + B[i];
         }
 
-        benchmark::DoNotOptimize(C.data());
+        benchmark::DoNotOptimize(C_add1.data());
         // benchmark::ClobberMemory();
     }
 
@@ -87,6 +87,28 @@ BENCHMARK_REGISTER_F(Fixture, MatrixAdd)
     ->RangeMultiplier(4)
     ->Range(1 << 10, 1 << 20);
 
+// matrix add 2
+BENCHMARK_DEFINE_F(Fixture, MatrixAdd_2)(benchmark::State &state)
+{
+    size_t M = matrix_size * matrix_size;
+    std::vector<double> C_add2(M); // отдельный буфер для этого теста
+    for (auto _ : state)
+    {
+        for (size_t i = 0; i < M; i += 2)
+        {
+            C_add2[i] = A[i] + B[i];
+            C_add2[i + 1] = A[i + 1] + B[i + 1];
+        }
+
+        benchmark::DoNotOptimize(C_add2.data());
+        // benchmark::ClobberMemory();
+    }
+
+    state.SetItemsProcessed(int64_t(state.iterations()) * M);
+}
+BENCHMARK_REGISTER_F(Fixture, MatrixAdd_2)
+    ->RangeMultiplier(4)
+    ->Range(1 << 10, 1 << 20);
 //
 // scalar product
 //
