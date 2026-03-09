@@ -94,10 +94,12 @@ BENCHMARK_DEFINE_F(Fixture, MatrixAdd_2)(benchmark::State &state)
     std::vector<double> C_add2(M); // отдельный буфер для этого теста
     for (auto _ : state)
     {
-        for (size_t i = 0; i < M; i += 2)
+        for (size_t i = 0; i < M; i += 4)
         {
             C_add2[i] = A[i] + B[i];
             C_add2[i + 1] = A[i + 1] + B[i + 1];
+            C_add2[i + 2] = A[i + 2] + B[i + 2];
+            C_add2[i + 3] = A[i + 3] + B[i + 3];
         }
 
         benchmark::DoNotOptimize(C_add2.data());
