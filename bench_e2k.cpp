@@ -16,12 +16,25 @@ struct Fixture : public benchmark::Fixture
     std::vector<double> B;
     std::vector<double> C;
 
+    // массивы для EML
+    // eml_64f *A_eml = nullptr;
+    // eml_64f *B_eml = nullptr;
+    // eml_64f *C_eml = nullptr;
+
+    double *A_eml;
+    double *B_eml;
+    double *C_eml;
+    A_eml = (double *)malloc(N * sizeof(double));
+    B_eml = (double *)malloc(N * sizeof(double));
+    C_eml = (double *)malloc(N * sizeof(double));
+
     size_t matrix_size;
 
     void SetUp(const ::benchmark::State &state)
     {
         size_t N = state.range(0);
 
+        // ключи для хэш/дерева
         keys.resize(N);
         std::iota(keys.begin(), keys.end(), 0);
 
@@ -36,20 +49,31 @@ struct Fixture : public benchmark::Fixture
             btree_index[keys[i]] = double(keys[i]);
         }
 
-        // матрицы
+        // размер матрицы
         matrix_size = std::sqrt(N);
         matrix_size = std::max<size_t>(matrix_size, 4);
-
         size_t M = matrix_size * matrix_size;
 
+        // std::vector (для сравнения или других тестов)
         A.resize(M);
         B.resize(M);
         C.resize(M);
-
         for (size_t i = 0; i < M; i++)
         {
             A[i] = double(i);
             B[i] = double(i % 7);
+        }
+
+        // // выделение массивов для EML
+        // A_eml = new eml_64f[M];
+        // B_eml = new eml_64f[M];
+        // C_eml = new eml_64f[M];
+
+        // инициализация EML-массивов
+        for (size_t i = 0; i < M; ++i)
+        {
+            A_eml[i] = double(i);
+            B_eml[i] = double(i % 7);
         }
     }
 
@@ -61,6 +85,13 @@ struct Fixture : public benchmark::Fixture
         A.clear();
         B.clear();
         C.clear();
+
+        // освобождение EML-массивов
+        delete[] A_eml;
+        delete[] B_eml;
+        delete[] C_eml;
+
+        A_eml = B_eml = C_eml = nullptr;
     }
 };
 
@@ -70,23 +101,23 @@ struct Fixture : public benchmark::Fixture
 BENCHMARK_DEFINE_F(Fixture, MatrixAdd)(benchmark::State &state)
 {
     size_t M = matrix_size * matrix_size;
-    std::vector<double> C_add1(M); // отдельный буфер для этого теста
+    // std::vector<double> C_add1(M); // отдельный буфер для этого теста
     for (auto _ : state)
     {
         for (size_t i = 0; i < M; ++i)
         {
-            eml_Vector_Mul_64F(C_add1, A, B, M);
+            eml_Vector_Add_64F(C_eml, A_eml, B_eml, M);
+            benchmark::DoNotOptimize(C_eml);
         }
 
-        benchmark::DoNotOptimize(C_add1.data());
         // benchmark::ClobberMemory();
     }
 
     state.SetItemsProcessed(int64_t(state.iterations()) * M);
 }
 BENCHMARK_REGISTER_F(Fixture, MatrixAdd)
-    ->RangeMultiplier(4)
-    ->Range(1 << 10, 1 << 20);
+    ->RangeMultiplier(8)
+    ->Range(1 << 10, 1 << 40);
 
 // matrix add 2
 BENCHMARK_DEFINE_F(Fixture, MatrixAdd_2)(benchmark::State &state)
