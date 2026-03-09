@@ -4,6 +4,7 @@
 #include <vector>
 #include <random>
 #include <algorithm>
+#include <eml.h>
 
 struct Fixture : public benchmark::Fixture
 {
@@ -74,7 +75,7 @@ BENCHMARK_DEFINE_F(Fixture, MatrixAdd)(benchmark::State &state)
     {
         for (size_t i = 0; i < M; ++i)
         {
-            C_add1[i] = A[i] + B[i];
+            eml_add(&C_add1[0], &A[0], &B[0], M);
         }
 
         benchmark::DoNotOptimize(C_add1.data());
