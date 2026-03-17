@@ -2,8 +2,8 @@ build:
 	g++ -O3 -march=native -std=c++20 main.cpp \
     -lbenchmark -lpthread -o benchmark_db
 build-amd64:
-	g++ -O3 -mavx2 -std=c++20 bench_amd64.cpp \
-    -lbenchmark -lpthread -o benchmark_db
+	g++ -O3 -march=native -std=c++20 bench_arm64.cpp \
+	-lbenchmark -lpthread -o benchmark_db
 disable-cpu-boost-amd64:
 	echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost
 	sudo cpupower frequency-set --governor performance
