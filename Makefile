@@ -4,6 +4,9 @@ build:
 build-test:
 	g++ -O3 -march=native -std=c++20 test.cpp \
     -lbenchmark -lpthread -o benchmark_db
+build-hash:
+	g++ -O3 -march=native -std=c++20 bench_hash.cpp \
+    -lbenchmark -lpthread -o benchmark_db
 build-encrypt:
 	g++ -O3 -march=native -std=c++20 bench_encrypt.cpp \
     -lbenchmark -lpthread -o benchmark_db
