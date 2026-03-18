@@ -3,3 +3,7 @@
 !Makefile
 !README.md
 !.gitignore
+!/compare_util/
+!/compare_util/*
+/compare_util/*.json
+/compare_util/*.csv
