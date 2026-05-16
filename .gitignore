@@ -3,12 +3,21 @@
 !Makefile
 !README.md
 !.gitignore
+!/benchdb/
+!/benchdb/*
+!/benchdb/cmd/*
+!/benchdb/internal/*
+!/benchdb/internal/vendor
+!/benchdb/internal/vendor/*
 !/compare_util/
 !/compare_util/*
 !/compare_util/cmd/*
 !/compare_util/internal/*
 !/compare_util/vendor/
 !/compare_util/vendor/*
+/compare_util/*.json
+/benchdb/*.csv
+/benchdb/*.json
 /compare_util/*.json
 /compare_util/*.csv
 
