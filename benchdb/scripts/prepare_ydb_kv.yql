@@ -1,0 +1,5 @@
+CREATE TABLE IF NOT EXISTS `kv` (
+    `key` Utf8 NOT NULL,
+    `value` Utf8,
+    PRIMARY KEY (`key`)
+);
