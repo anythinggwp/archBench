@@ -122,3 +122,47 @@ CREATE TABLE IF NOT EXISTS %s (
 func quotePostgresIdentifier(identifier string) string {
 	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
 }
+
+func cleanupPostgres(ctx context.Context, cfg Config) error {
+	connectCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
+	defer cancel()
+
+	poolCfg, err := pgxpool.ParseConfig(cfg.Postgres.ConnString)
+	if err != nil {
+		return fmt.Errorf("postgres parse connection string failed: %w", err)
+	}
+
+	maxConns := cfg.Postgres.MaxConns
+	if maxConns <= 0 {
+		maxConns = cfg.Concurrency
+	}
+
+	poolCfg.MaxConns = int32(maxConns)
+	poolCfg.ConnConfig.ConnectTimeout = cfg.Timeout
+
+	pool, err := pgxpool.NewWithConfig(connectCtx, poolCfg)
+	if err != nil {
+		return fmt.Errorf("postgres connect failed: %w", err)
+	}
+	defer pool.Close()
+
+	if !cfg.Postgres.SkipDDLInit {
+		if err := ensurePostgresTable(ctx, pool, cfg.Postgres.Table); err != nil {
+			return err
+		}
+	}
+
+	cleanupCtx, cleanupCancel := context.WithTimeout(ctx, cfg.Timeout)
+	defer cleanupCancel()
+
+	query := fmt.Sprintf(
+		`TRUNCATE TABLE %s`,
+		quotePostgresIdentifier(cfg.Postgres.Table),
+	)
+
+	if _, err := pool.Exec(cleanupCtx, query); err != nil {
+		return fmt.Errorf("postgres truncate table %q failed: %w", cfg.Postgres.Table, err)
+	}
+
+	return nil
+}

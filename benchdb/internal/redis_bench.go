@@ -65,3 +65,21 @@ func preloadRedis(ctx context.Context, client *redis.Client, cfg Config) error {
 	}
 	return nil
 }
+
+func cleanupRedis(ctx context.Context, cfg Config) error {
+	client := redis.NewClient(&redis.Options{
+		Addr:     cfg.Redis.Addr,
+		Password: cfg.Redis.Password,
+		DB:       cfg.Redis.DB,
+	})
+	defer client.Close()
+
+	cleanupCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
+	defer cancel()
+
+	if err := client.FlushDB(cleanupCtx).Err(); err != nil {
+		return fmt.Errorf("redis FLUSHDB failed: %w", err)
+	}
+
+	return nil
+}

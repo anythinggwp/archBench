@@ -142,3 +142,45 @@ func truncateTarantoolSpace(
 	_ = resp
 	return nil
 }
+
+func cleanupTarantool(ctx context.Context, cfg Config) error {
+	connectCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
+	defer cancel()
+
+	conn, err := tarantool.Connect(connectCtx, tarantool.NetDialer{
+		Address:  cfg.Tarantool.Addr,
+		User:     cfg.Tarantool.User,
+		Password: cfg.Tarantool.Password,
+	}, tarantool.Opts{
+		Timeout: cfg.Timeout,
+	})
+	if err != nil {
+		return fmt.Errorf("tarantool connect failed: %w", err)
+	}
+	defer conn.Close()
+
+	if !cfg.Tarantool.SkipDDLInit {
+		if err := ensureTarantoolSpace(conn, cfg.Tarantool.Space); err != nil {
+			return err
+		}
+	}
+
+	lua := `
+local space_name = ...
+local space = box.space[space_name]
+if space == nil then
+    error("space '" .. tostring(space_name) .. "' does not exist")
+end
+space:truncate()
+return space:len()
+`
+
+	_, err = conn.Do(
+		tarantool.NewEvalRequest(lua).Args([]interface{}{cfg.Tarantool.Space}),
+	).Get()
+	if err != nil {
+		return fmt.Errorf("tarantool truncate space %q failed: %w", cfg.Tarantool.Space, err)
+	}
+
+	return nil
+}

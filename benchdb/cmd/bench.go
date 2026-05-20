@@ -21,11 +21,12 @@ type benchFlags struct {
 	keyPrefix   string
 	timeout     time.Duration
 
-	runs            int
-	runDelay        time.Duration
-	requestsList    string
-	concurrencyList string
-	valueSizeList   string
+	runs               int
+	runDelay           time.Duration
+	cleanupBetweenRuns bool
+	requestsList       string
+	concurrencyList    string
+	valueSizeList      string
 
 	redisAddr     string
 	redisPassword string
@@ -126,6 +127,16 @@ var benchCmd = &cobra.Command{
 				for _, operation := range operations {
 					currentRun++
 
+					if flags.cleanupBetweenRuns {
+						if flags.print {
+							fmt.Fprintf(cmd.OutOrStdout(), "Cleaning selected databases before run %d/%d...\n", currentRun, totalRuns)
+						}
+
+						if err := bench.CleanupTargets(ctx, cfg, targets); err != nil {
+							return fmt.Errorf("cleanup before run %d/%d failed: %w", currentRun, totalRuns, err)
+						}
+					}
+
 					if flags.print {
 						fmt.Fprintf(cmd.OutOrStdout(),
 							"Running %d/%d: test=%d target=%s operation=%s requests=%d concurrency=%d value_size=%d\n",
@@ -202,6 +213,12 @@ func init() {
 
 	benchCmd.Flags().IntVar(&flags.runs, "runs", 1, "repeat every generated benchmark configuration N times")
 	benchCmd.Flags().DurationVar(&flags.runDelay, "run-delay", 0, "pause between sequential benchmark runs, for example 1s or 500ms")
+	benchCmd.Flags().BoolVar(
+		&flags.cleanupBetweenRuns,
+		"cleanup-between-runs",
+		false,
+		"clean selected benchmark databases before every target/operation run",
+	)
 	benchCmd.Flags().StringVar(&flags.requestsList, "requests-list", "", "comma-separated requests values; overrides --requests, for example 10000,50000,100000")
 	benchCmd.Flags().StringVar(&flags.concurrencyList, "concurrency-list", "", "comma-separated concurrency values; overrides --concurrency, for example 1,8,16,64")
 	benchCmd.Flags().StringVar(&flags.valueSizeList, "value-size-list", "", "comma-separated value-size values; overrides --value-size, for example 64,128,1024")

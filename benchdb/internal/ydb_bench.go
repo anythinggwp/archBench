@@ -118,3 +118,39 @@ CREATE TABLE IF NOT EXISTS %s (
 func ydbIdentifier(identifier string) string {
 	return "`" + strings.ReplaceAll(identifier, "`", "``") + "`"
 }
+
+func cleanupYDB(ctx context.Context, cfg Config) error {
+	db, err := sql.Open("ydb", cfg.YDB.ConnectionString)
+	if err != nil {
+		return fmt.Errorf("ydb open failed: %w", err)
+	}
+	defer db.Close()
+
+	maxOpenConns := cfg.YDB.MaxOpenConns
+	if maxOpenConns <= 0 {
+		maxOpenConns = cfg.Concurrency
+	}
+
+	db.SetMaxOpenConns(maxOpenConns)
+	db.SetMaxIdleConns(maxOpenConns)
+
+	if !cfg.YDB.SkipDDLInit {
+		if err := ensureYDBTable(ctx, db, cfg.YDB.Table); err != nil {
+			return err
+		}
+	}
+
+	cleanupCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
+	defer cancel()
+
+	query := fmt.Sprintf(
+		`DELETE FROM %s WHERE TRUE;`,
+		ydbIdentifier(cfg.YDB.Table),
+	)
+
+	if _, err := db.ExecContext(cleanupCtx, query); err != nil {
+		return fmt.Errorf("ydb delete from table %q failed: %w", cfg.YDB.Table, err)
+	}
+
+	return nil
+}

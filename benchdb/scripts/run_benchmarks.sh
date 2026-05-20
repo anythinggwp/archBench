@@ -62,6 +62,7 @@ POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-bench_password}"
 
 RUN_DELAY="${RUN_DELAY:-1s}"
 TIMEOUT="${TIMEOUT:-5s}"
+CLEANUP_BETWEEN_RUNS="${CLEANUP_BETWEEN_RUNS:-1}"
 
 mkdir -p "$RESULTS_DIR"
 
@@ -102,6 +103,10 @@ fi
 
 if [[ "$POSTGRES_NO_DDL" == "1" || "$POSTGRES_NO_DDL" == "true" || "$POSTGRES_NO_DDL" == "yes" ]]; then
   common_flags+=(--postgres-no-ddl)
+fi
+
+if [[ "$CLEANUP_BETWEEN_RUNS" == "1" || "$CLEANUP_BETWEEN_RUNS" == "true" || "$CLEANUP_BETWEEN_RUNS" == "yes" ]]; then
+  common_flags+=(--cleanup-between-runs)
 fi
 
 run_scenario() {
@@ -148,6 +153,7 @@ postgres_max_conns=$POSTGRES_MAX_CONNS
 run_delay=$RUN_DELAY
 timeout=$TIMEOUT
 binary=$DBBENCH_BIN
+cleanup_between_runs=$CLEANUP_BETWEEN_RUNS
 EOF_MANIFEST
 }
 
