@@ -1,2 +1,2 @@
 build:
-	go build -o benchdb
+	go build -o dbbench

@@ -43,11 +43,15 @@ save 60 1000
 loglevel notice
 EOF
 
+    # memtx_max_tuple_size = 18 * 1024,
+    # readahead = 18 * 1024,
+
 cat > "$PROJECT_DIR/tarantool/init.lua" <<'EOF'
 box.cfg{
     listen = '0.0.0.0:3301',
 
-    memtx_memory = 128 * 1024 * 1024,
+    memtx_memory = 4 * 1024 * 1024 * 1024,
+
 
     wal_mode = 'write',
 
@@ -134,6 +138,11 @@ services:
     networks:
       - db-net
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 5G
 
   tarantool:
     build:
@@ -148,6 +157,11 @@ services:
     networks:
       - db-net
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 5G
 
 networks:
   db-net:

@@ -1,4 +1,4 @@
-package bench
+package internal
 
 import (
 	"context"
@@ -110,5 +110,35 @@ return true
 	if err != nil {
 		return fmt.Errorf("tarantool space init failed: %w; create space manually or use --tarantool-no-ddl", err)
 	}
+	return nil
+}
+
+func truncateTarantoolSpace(
+	ctx context.Context,
+	conn *tarantool.Connection,
+	spaceName string,
+) error {
+	if spaceName == "" {
+		return fmt.Errorf("tarantool space name is empty")
+	}
+
+	lua := `
+		local space_name = ...
+		local s = box.space[space_name]
+		if s == nil then
+			error("space '" .. tostring(space_name) .. "' does not exist")
+		end
+		s:truncate()
+		return s:len()
+	`
+
+	req := tarantool.NewEvalRequest(lua).Args([]interface{}{spaceName})
+
+	resp, err := conn.Do(req).GetResponse()
+	if err != nil {
+		return fmt.Errorf("tarantool truncate space %q failed: %w", spaceName, err)
+	}
+
+	_ = resp
 	return nil
 }
