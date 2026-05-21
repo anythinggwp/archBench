@@ -177,7 +177,7 @@ run_standard() {
   run_scenario "02_concurrency_scaling" \
     --operation all \
     --requests 100000 \
-    --concurrency-list 1,2,4,8,16,32,64,128 \
+    --concurrency-list 1,2,4,8,16,32,64,128,256,512,1024 \
     --value-size 128 \
     --runs 3
 
@@ -245,12 +245,13 @@ run_write() {
 }
 
 run_real_size(){
-    run_scenario "09_write_set_value_with_real_size" \
-    --operation set \
-    --requests 50000 \
-    --concurrency 32 \
+
+  run_scenario "02_concurrency_scaling_all" \
+    --operation all \
+    --requests 100000 \
+    --concurrency-list 1,2,4,8,16,32,64,128 \
     --value-size 17408 \
-    --runs 5
+    --runs 3
 }
 
 run_full() {
