@@ -28,9 +28,11 @@ type benchFlags struct {
 	concurrencyList    string
 	valueSizeList      string
 
-	redisAddr     string
-	redisPassword string
-	redisDB       int
+	redisMode         string
+	redisAddr         string
+	redisClusterAddrs string
+	redisPassword     string
+	redisDB           int
 
 	tarantoolAddr     string
 	tarantoolUser     string
@@ -72,7 +74,10 @@ var benchCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-
+		redisClusterAddrs, err := parseStringList(flags.redisClusterAddrs)
+		if err != nil {
+			return err
+		}
 		baseCfg := bench.Config{
 			Requests:    flags.requests,
 			Concurrency: flags.concurrency,
@@ -80,9 +85,11 @@ var benchCmd = &cobra.Command{
 			KeyPrefix:   flags.keyPrefix,
 			Timeout:     flags.timeout,
 			Redis: bench.RedisConfig{
-				Addr:     flags.redisAddr,
-				Password: flags.redisPassword,
-				DB:       flags.redisDB,
+				Mode:         flags.redisMode,
+				Addr:         flags.redisAddr,
+				ClusterAddrs: redisClusterAddrs,
+				Password:     flags.redisPassword,
+				DB:           flags.redisDB,
 			},
 			Tarantool: bench.TarantoolConfig{
 				Addr:        flags.tarantoolAddr,
@@ -223,7 +230,19 @@ func init() {
 	benchCmd.Flags().StringVar(&flags.concurrencyList, "concurrency-list", "", "comma-separated concurrency values; overrides --concurrency, for example 1,8,16,64")
 	benchCmd.Flags().StringVar(&flags.valueSizeList, "value-size-list", "", "comma-separated value-size values; overrides --value-size, for example 64,128,1024")
 
+	benchCmd.Flags().StringVar(
+		&flags.redisMode,
+		"redis-mode",
+		"standalone",
+		"Redis client mode: standalone or cluster",
+	)
 	benchCmd.Flags().StringVar(&flags.redisAddr, "redis-addr", "127.0.0.1:6379", "Redis address")
+	benchCmd.Flags().StringVar(
+		&flags.redisClusterAddrs,
+		"redis-cluster-addrs",
+		"127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003",
+		"comma-separated Redis Cluster node addresses",
+	)
 	benchCmd.Flags().StringVar(&flags.redisPassword, "redis-password", "", "Redis password")
 	benchCmd.Flags().IntVar(&flags.redisDB, "redis-db", 0, "Redis DB number")
 
@@ -242,9 +261,9 @@ func init() {
 	benchCmd.Flags().StringVar(&flags.postgresTable, "postgres-table", "kv", "PostgreSQL table name")
 	benchCmd.Flags().BoolVar(&flags.postgresNoDDL, "postgres-no-ddl", false, "do not create PostgreSQL table automatically")
 	benchCmd.Flags().IntVar(&flags.postgresMaxConns, "postgres-max-conns", 0, "PostgreSQL pool max connections; 0 means use --concurrency")
-	benchCmd.Flags().StringVar(&flags.postgreUser, "postgres-user", "bench", "PostgreSQL username for connection")
-	benchCmd.Flags().StringVar(&flags.postgrePassword, "postgres-password", "bench_password", "PostgreSQL password connection")
-	benchCmd.Flags().StringVar(&flags.postgreDB, "postgres-db", "benchdb", "PostgreSQL database")
+	benchCmd.Flags().StringVar(&flags.postgreUser, "postgres-user", "postgres", "PostgreSQL username for connection")
+	benchCmd.Flags().StringVar(&flags.postgrePassword, "postgres-password", "postgres", "PostgreSQL password connection")
+	benchCmd.Flags().StringVar(&flags.postgreDB, "postgres-db", "postgres", "PostgreSQL database")
 
 	benchCmd.Flags().BoolVar(&flags.print, "print", true, "print results to terminal")
 	benchCmd.Flags().BoolVar(&flags.summary, "summary", false, "print and save aggregated summary grouped by target, operation, requests, concurrency and value-size")
@@ -374,6 +393,25 @@ func parsePositiveIntList(flagName string, raw string, fallback int) ([]int, err
 		}
 
 		values = append(values, value)
+	}
+
+	return values, nil
+}
+
+func parseStringList(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+
+	parts := strings.Split(raw, ",")
+	values := make([]string, 0, len(parts))
+
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, fmt.Errorf("string list contains empty value")
+		}
+		values = append(values, part)
 	}
 
 	return values, nil

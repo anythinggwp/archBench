@@ -46,9 +46,14 @@ type Config struct {
 }
 
 type RedisConfig struct {
-	Addr     string
-	Password string
-	DB       int
+	// Mode selects Redis client implementation:
+	//   standalone - ordinary single-node Redis client
+	//   cluster    - Redis Cluster client with hash-slot routing
+	Mode         string
+	Addr         string
+	ClusterAddrs []string
+	Password     string
+	DB           int
 }
 
 type TarantoolConfig struct {
@@ -151,8 +156,24 @@ func (c Config) Validate() error {
 	if c.KeyPrefix == "" {
 		return errors.New("key-prefix must not be empty")
 	}
-	if c.Redis.Addr == "" {
-		return errors.New("redis-addr must not be empty")
+	redisMode := strings.ToLower(strings.TrimSpace(c.Redis.Mode))
+	if redisMode == "" {
+		redisMode = "standalone"
+	}
+
+	switch redisMode {
+	case "standalone", "single":
+		if c.Redis.Addr == "" {
+			return errors.New("redis-addr must not be empty")
+		}
+
+	case "cluster":
+		if len(c.Redis.ClusterAddrs) == 0 {
+			return errors.New("redis-cluster-addrs must not be empty when redis-mode=cluster")
+		}
+
+	default:
+		return fmt.Errorf("invalid redis-mode %q: use standalone or cluster", c.Redis.Mode)
 	}
 	if c.Tarantool.Addr == "" {
 		return errors.New("tarantool-addr must not be empty")

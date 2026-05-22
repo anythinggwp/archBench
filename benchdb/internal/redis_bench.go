@@ -3,17 +3,17 @@ package internal
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
 func RunRedis(ctx context.Context, cfg Config, operation Operation) (Result, error) {
-	client := redis.NewClient(&redis.Options{
-		Addr:     cfg.Redis.Addr,
-		Password: cfg.Redis.Password,
-		DB:       cfg.Redis.DB,
-	})
+	client, err := newRedisBenchmarkClient(cfg)
+	if err != nil {
+		return Result{}, err
+	}
 	defer client.Close()
 
 	pingCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
@@ -35,19 +35,19 @@ func RunRedis(ctx context.Context, cfg Config, operation Operation) (Result, err
 	}
 }
 
-func runRedisSet(ctx context.Context, client *redis.Client, cfg Config) Result {
+func runRedisSet(ctx context.Context, client redis.UniversalClient, cfg Config) Result {
 	return runMeasured(TargetRedis, OperationSet, cfg, func(key string, value string) error {
 		return client.Set(ctx, key, value, 0).Err()
 	})
 }
 
-func runRedisGet(ctx context.Context, client *redis.Client, cfg Config) Result {
+func runRedisGet(ctx context.Context, client redis.UniversalClient, cfg Config) Result {
 	return runMeasured(TargetRedis, OperationGet, cfg, func(key string, value string) error {
 		return client.Get(ctx, key).Err()
 	})
 }
 
-func preloadRedis(ctx context.Context, client *redis.Client, cfg Config) error {
+func preloadRedis(ctx context.Context, client redis.UniversalClient, cfg Config) error {
 	value := make([]byte, cfg.ValueSize)
 	for i := range value {
 		value[i] = 'x'
@@ -67,11 +67,10 @@ func preloadRedis(ctx context.Context, client *redis.Client, cfg Config) error {
 }
 
 func cleanupRedis(ctx context.Context, cfg Config) error {
-	client := redis.NewClient(&redis.Options{
-		Addr:     cfg.Redis.Addr,
-		Password: cfg.Redis.Password,
-		DB:       cfg.Redis.DB,
-	})
+	client, err := newRedisBenchmarkClient(cfg)
+	if err != nil {
+		return err
+	}
 	defer client.Close()
 
 	cleanupCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
@@ -82,4 +81,69 @@ func cleanupRedis(ctx context.Context, cfg Config) error {
 	}
 
 	return nil
+}
+
+func newRedisBenchmarkClient(cfg Config) (redis.UniversalClient, error) {
+	poolSize := cfg.Concurrency * 2
+	if poolSize < 10 {
+		poolSize = 10
+	}
+
+	switch normalizedRedisMode(cfg.Redis.Mode) {
+	case "standalone":
+		return redis.NewClient(&redis.Options{
+			Addr:         cfg.Redis.Addr,
+			Password:     cfg.Redis.Password,
+			DB:           cfg.Redis.DB,
+			DialTimeout:  cfg.Timeout,
+			ReadTimeout:  cfg.Timeout,
+			WriteTimeout: cfg.Timeout,
+			PoolSize:     poolSize,
+		}), nil
+
+	case "cluster":
+		addrs := cleanStringList(cfg.Redis.ClusterAddrs)
+		if len(addrs) == 0 {
+			return nil, fmt.Errorf("redis cluster mode requires at least one address in --redis-cluster-addrs")
+		}
+
+		return redis.NewClusterClient(&redis.ClusterOptions{
+			Addrs:        addrs,
+			Password:     cfg.Redis.Password,
+			DialTimeout:  cfg.Timeout,
+			ReadTimeout:  cfg.Timeout,
+			WriteTimeout: cfg.Timeout,
+			PoolSize:     poolSize,
+		}), nil
+
+	default:
+		return nil, fmt.Errorf("invalid redis mode %q", cfg.Redis.Mode)
+	}
+}
+
+func normalizedRedisMode(mode string) string {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+
+	switch mode {
+	case "", "single", "standalone", "node":
+		return "standalone"
+
+	case "cluster", "redis-cluster":
+		return "cluster"
+
+	default:
+		return mode
+	}
+}
+func cleanStringList(values []string) []string {
+	cleaned := make([]string, 0, len(values))
+
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			cleaned = append(cleaned, value)
+		}
+	}
+
+	return cleaned
 }
