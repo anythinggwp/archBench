@@ -58,10 +58,22 @@ type RedisConfig struct {
 
 type TarantoolConfig struct {
 	Addr        string
+	Addrs       []string
 	User        string
 	Password    string
 	Space       string
 	SkipDDLInit bool
+	MaxConns    int
+
+	// direct — старый режим через space:replace/get
+	// call   — вызов Lua-функций
+	// vshard — вызов Lua-функций на vshard-router
+	// crud   — вызов официального CRUD API на vshard-router
+	Mode string
+
+	SetFunc      string
+	GetFunc      string
+	TruncateFunc string
 }
 
 type YDBConfig struct {
@@ -175,14 +187,39 @@ func (c Config) Validate() error {
 	default:
 		return fmt.Errorf("invalid redis-mode %q: use standalone or cluster", c.Redis.Mode)
 	}
-	if c.Tarantool.Addr == "" {
-		return errors.New("tarantool-addr must not be empty")
+	if len(c.Tarantool.Addrs) == 0 && strings.TrimSpace(c.Tarantool.Addr) == "" {
+		return errors.New("tarantool-addr or tarantool-addrs must not be empty")
+	}
+	for _, addr := range c.Tarantool.Addrs {
+		if strings.TrimSpace(addr) == "" {
+			return errors.New("tarantool-addrs must not contain empty addresses")
+		}
 	}
 	if c.Tarantool.User == "" {
 		return errors.New("tarantool-user must not be empty")
 	}
 	if c.Tarantool.Space == "" {
 		return errors.New("tarantool-space must not be empty")
+	}
+	if c.Tarantool.MaxConns < 0 {
+		return errors.New("tarantool-max-conns must not be negative")
+	}
+	tarantoolMode := normalizeTarantoolMode(c.Tarantool.Mode)
+	switch tarantoolMode {
+	case "direct", "call", "vshard", "crud":
+	default:
+		return fmt.Errorf("invalid tarantool-mode %q: use direct, call, vshard or crud", c.Tarantool.Mode)
+	}
+	if tarantoolMode == "call" || tarantoolMode == "vshard" {
+		if strings.TrimSpace(c.Tarantool.SetFunc) == "" {
+			return errors.New("tarantool-set-func must not be empty in call/vshard mode")
+		}
+		if strings.TrimSpace(c.Tarantool.GetFunc) == "" {
+			return errors.New("tarantool-get-func must not be empty in call/vshard mode")
+		}
+		if strings.TrimSpace(c.Tarantool.TruncateFunc) == "" {
+			return errors.New("tarantool-truncate-func must not be empty in call/vshard mode")
+		}
 	}
 	if c.YDB.ConnectionString == "" {
 		return errors.New("ydb-connection-string must not be empty")

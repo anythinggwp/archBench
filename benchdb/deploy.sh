@@ -38,6 +38,13 @@ set -euo pipefail
 #   TARANTOOL_TOPOLOGY=sharding4             # manual router by hash(key), 4 nodes
 #   TARANTOOL_TOPOLOGY=sharding_replication4 # manual router: 2 shards x 2 replicas
 #
+# Tarantool vshard topology:
+#   TARANTOOL_TOPOLOGY=vshard2               # 1 router + 2 vshard storages
+#   TARANTOOL_TOPOLOGY=vshard3               # 1 router + 3 vshard storages
+#   TARANTOOL_TOPOLOGY=vshard4               # 1 router + 4 vshard storages
+#   TARANTOOL_ROUTER_CPU_LIMIT=2.0           # vshard router CPU cap
+#   TARANTOOL_STORAGE_CPU_LIMIT=1.0          # vshard storage CPU cap
+#
 # Prepared configs:
 #   CONFIG_DIR=./configs ./deploy.sh
 #
@@ -58,7 +65,8 @@ set -euo pipefail
 # IMPORTANT:
 # - sharding2/sharding4 for Redis are manual independent shards; benchmark must route keys itself.
 # - cluster_* modes are real Redis Cluster; benchmark must use redis.ClusterClient.
-# - Tarantool sharding modes here are simplified manual routing, not vshard.
+# - Tarantool sharding2/sharding4 modes are simplified manual routing, not vshard.
+# - Tarantool vshard2/vshard3/vshard4 modes use the Tarantool vshard module.
 # ============================================================
 
 PROJECT_DIR="${PROJECT_DIR:-redis-tarantool-stack}"
@@ -112,12 +120,16 @@ REDIS_CPU_LIMIT="${REDIS_CPU_LIMIT:-1.0}"
 REDIS_MEMORY_LIMIT="${REDIS_MEMORY_LIMIT:-5G}"
 
 TARANTOOL_CPU_LIMIT="${TARANTOOL_CPU_LIMIT:-1.0}"
+TARANTOOL_ROUTER_CPU_LIMIT="${TARANTOOL_ROUTER_CPU_LIMIT:-2.0}"
+TARANTOOL_STORAGE_CPU_LIMIT="${TARANTOOL_STORAGE_CPU_LIMIT:-${TARANTOOL_CPU_LIMIT}}"
 TARANTOOL_MEMORY_LIMIT="${TARANTOOL_MEMORY_LIMIT:-5G}"
 TARANTOOL_MEMTX_MEMORY="${TARANTOOL_MEMTX_MEMORY:-4294967296}"
 TARANTOOL_USER="${TARANTOOL_USER:-app}"
 TARANTOOL_PASSWORD="${TARANTOOL_PASSWORD:-app_pass}"
 TARANTOOL_SPACE="${TARANTOOL_SPACE:-kv}"
 TARANTOOL_WAL_MODE="${TARANTOOL_WAL_MODE:-none}"
+TARANTOOL_VSHARD_BUCKET_COUNT="${TARANTOOL_VSHARD_BUCKET_COUNT:-3000}"
+TARANTOOL_VSHARD_VERSION="${TARANTOOL_VSHARD_VERSION:-0.1.40}"
 TARANTOOL_REPLICATION_USER="${TARANTOOL_REPLICATION_USER:-replicator}"
 TARANTOOL_REPLICATION_PASSWORD="${TARANTOOL_REPLICATION_PASSWORD:-replicator_pass}"
 
@@ -204,7 +216,7 @@ validate_topologies() {
     esac
 
     case "$TARANTOOL_TOPOLOGY" in
-        single|replication2|replication4|sharding2|sharding4|sharding_replication4)
+        single|replication2|replication4|sharding2|sharding4|sharding_replication4|vshard2|vshard3|vshard4)
             ;;
         *)
             die "Unknown TARANTOOL_TOPOLOGY: $TARANTOOL_TOPOLOGY"
@@ -290,6 +302,22 @@ tarantool_shard_count() {
     esac
 }
 
+tarantool_vshard_shard_count() {
+    case "$TARANTOOL_TOPOLOGY" in
+        vshard2) echo 2 ;;
+        vshard3) echo 3 ;;
+        vshard4) echo 4 ;;
+        *) echo 0 ;;
+    esac
+}
+
+tarantool_is_vshard_topology() {
+    case "$TARANTOOL_TOPOLOGY" in
+        vshard2|vshard3|vshard4) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 compose_down_old() {
     if [[ -d "$PROJECT_DIR" && -f "$PROJECT_DIR/docker-compose.yml" ]]; then
         log "Stopping old compose project"
@@ -343,6 +371,11 @@ remove_old_containers() {
     docker rm -f tarantool-s1-r2 2>/dev/null || true
     docker rm -f tarantool-s2-r1 2>/dev/null || true
     docker rm -f tarantool-s2-r2 2>/dev/null || true
+    docker rm -f tarantool-vshard-router 2>/dev/null || true
+    docker rm -f tarantool-vshard-storage-1 2>/dev/null || true
+    docker rm -f tarantool-vshard-storage-2 2>/dev/null || true
+    docker rm -f tarantool-vshard-storage-3 2>/dev/null || true
+    docker rm -f tarantool-vshard-storage-4 2>/dev/null || true
 
     docker rm -f "$POSTGRES_CONTAINER" 2>/dev/null || true
     docker rm -f "$YDB_CONTAINER" 2>/dev/null || true
@@ -521,6 +554,57 @@ write_redis_config() {
 # Tarantool config
 # ------------------------------------------------------------
 
+write_tarantool_vshard_cfg() {
+    if ! enabled tarantool; then
+        return 0
+    fi
+
+    if ! tarantool_is_vshard_topology; then
+        cat > "$PROJECT_DIR/tarantool/vshard_cfg.lua" <<'EOF2'
+return {
+    bucket_count = 3000,
+    sharding = {},
+}
+EOF2
+        return 0
+    fi
+
+    local shards
+    shards="$(tarantool_vshard_shard_count)"
+
+    log "Generating Tarantool vshard config, shards=${shards}, bucket_count=${TARANTOOL_VSHARD_BUCKET_COUNT}"
+
+    cat > "$PROJECT_DIR/tarantool/vshard_cfg.lua" <<EOF2
+return {
+    bucket_count = ${TARANTOOL_VSHARD_BUCKET_COUNT},
+    sharding = {
+EOF2
+
+    for shard in $(seq 1 "$shards"); do
+        local rs_uuid
+        local instance_uuid
+        rs_uuid=$(printf '11111111-1111-1111-1111-%012d' "$shard")
+        instance_uuid=$(printf '22222222-2222-2222-2222-%012d' "$shard")
+
+        cat >> "$PROJECT_DIR/tarantool/vshard_cfg.lua" <<EOF2
+        ['${rs_uuid}'] = {
+            replicas = {
+                ['${instance_uuid}'] = {
+                    uri = '${TARANTOOL_USER}:${TARANTOOL_PASSWORD}@tarantool-vshard-storage-${shard}:3301',
+                    name = 'tarantool-vshard-storage-${shard}',
+                    master = true,
+                },
+            },
+        },
+EOF2
+    done
+
+    cat >> "$PROJECT_DIR/tarantool/vshard_cfg.lua" <<'EOF2'
+    },
+}
+EOF2
+}
+
 write_tarantool_files() {
     if ! enabled tarantool; then
         return 0
@@ -533,11 +617,14 @@ write_tarantool_files() {
 
     local src=""
 
+    write_tarantool_vshard_cfg
+
     if src="$(resolve_config_file "$TARANTOOL_INIT_FILE" "tarantool/init.lua")"; then
         echo "Using prepared Tarantool init.lua: $src"
         cp "$src" "$PROJECT_DIR/tarantool/init.lua"
     else
         cat > "$PROJECT_DIR/tarantool/init.lua" <<'EOF2'
+local fiber = require('fiber')
 local net_box = require('net.box')
 
 local node_name = os.getenv('TARANTOOL_NODE_NAME') or 'tarantool'
@@ -558,6 +645,11 @@ local replication_raw = os.getenv('TARANTOOL_REPLICATION') or ''
 local shard_uris_raw = os.getenv('TARANTOOL_SHARD_URIS') or ''
 local read_only = os.getenv('TARANTOOL_READ_ONLY') == 'true'
 
+local vshard_role = os.getenv('TARANTOOL_VSHARD_ROLE') or ''
+local instance_uuid = os.getenv('TARANTOOL_INSTANCE_UUID') or ''
+local replicaset_uuid = os.getenv('TARANTOOL_REPLICASET_UUID') or ''
+local is_vshard = topology == 'vshard2' or topology == 'vshard3' or topology == 'vshard4'
+
 local function split_csv(s)
     local result = {}
 
@@ -566,6 +658,96 @@ local function split_csv(s)
     end
 
     return result
+end
+
+local function grant_user(user, privilege, object_type, object_name)
+    local ok, err = pcall(function()
+        box.schema.user.grant(user, privilege, object_type, object_name, {
+            if_not_exists = true
+        })
+    end)
+
+    if not ok and not tostring(err):match('Duplicate') and not tostring(err):match('already') then
+        error(err)
+    end
+end
+
+local function ensure_app_user()
+    box.schema.user.create(app_user, {
+        password = app_password,
+        if_not_exists = true
+    })
+
+    grant_user(app_user, 'read', 'universe', nil)
+    grant_user(app_user, 'write', 'universe', nil)
+    grant_user(app_user, 'execute', 'universe', nil)
+end
+
+local function ensure_replication_user_if_needed()
+    if replication_raw == '' then
+        return
+    end
+
+    box.schema.user.create(repl_user, {
+        password = repl_password,
+        if_not_exists = true
+    })
+
+    local ok, err = pcall(function()
+        box.schema.user.grant(repl_user, 'replication')
+    end)
+
+    if not ok and not tostring(err):match('Duplicate') and not tostring(err):match('already') then
+        error(err)
+    end
+end
+
+local function create_plain_schema()
+    local kv = box.schema.space.create(space_name, {
+        if_not_exists = true
+    })
+
+    kv:format({
+        {name = 'key', type = 'string'},
+        {name = 'value', type = 'string'}
+    })
+
+    kv:create_index('primary', {
+        type = 'HASH',
+        parts = {
+            {field = 1, type = 'string'}
+        },
+        if_not_exists = true
+    })
+end
+
+local function create_vshard_storage_schema()
+    local kv = box.schema.space.create(space_name, {
+        if_not_exists = true
+    })
+
+    kv:format({
+        {name = 'key', type = 'string'},
+        {name = 'bucket_id', type = 'unsigned'},
+        {name = 'value', type = 'string'}
+    })
+
+    kv:create_index('primary', {
+        type = 'HASH',
+        parts = {
+            {field = 1, type = 'string'}
+        },
+        if_not_exists = true
+    })
+
+    kv:create_index('bucket_id', {
+        type = 'TREE',
+        parts = {
+            {field = 2, type = 'unsigned'}
+        },
+        unique = false,
+        if_not_exists = true
+    })
 end
 
 local shard_uris = {}
@@ -586,69 +768,10 @@ local cfg = {
     read_only = false,
 }
 
--- Replication is enabled only for replication topologies.
--- Pure sharding2/sharding4 must not configure replication.
-if replication_raw ~= '' then
+if not is_vshard and replication_raw ~= '' then
     cfg.replication = split_csv(replication_raw)
     cfg.bootstrap_strategy = 'auto'
     cfg.replication_timeout = 1
-end
-
-box.cfg(cfg)
-
-box.once('bootstrap_schema_v1', function()
-    box.schema.user.create(app_user, {
-        password = app_password,
-        if_not_exists = true
-    })
-
-    box.schema.user.grant(app_user, 'read', 'universe', nil, {
-        if_not_exists = true
-    })
-
-    box.schema.user.grant(app_user, 'write', 'universe', nil, {
-        if_not_exists = true
-    })
-
-    box.schema.user.grant(app_user, 'execute', 'universe', nil, {
-        if_not_exists = true
-    })
-
-    if replication_raw ~= '' then
-        box.schema.user.create(repl_user, {
-            password = repl_password,
-            if_not_exists = true
-        })
-
-        local ok, err = pcall(function()
-            box.schema.user.grant(repl_user, 'replication')
-        end)
-
-        if not ok and not tostring(err):match('Duplicate') and not tostring(err):match('already') then
-            error(err)
-        end
-    end
-
-    local kv = box.schema.space.create(space_name, {
-        if_not_exists = true
-    })
-
-    kv:format({
-        {name = 'key', type = 'string'},
-        {name = 'value', type = 'string'}
-    })
-
-    kv:create_index('primary', {
-        type = 'HASH',
-        parts = {
-            {field = 1, type = 'string'}
-        },
-        if_not_exists = true
-    })
-end)
-
-if read_only then
-    box.cfg{read_only = true}
 end
 
 local function hash_key(key)
@@ -689,58 +812,236 @@ local function remote_call(uri, fn, args)
     return result
 end
 
-rawset(_G, 'put_local', function(key, value)
-    return box.space[space_name]:replace{key, value}
-end)
+local function start_plain_or_manual_sharding()
+    box.cfg(cfg)
 
-rawset(_G, 'get_local', function(key)
-    return box.space[space_name]:get{key}
-end)
+    box.once('bootstrap_schema_v1', function()
+        ensure_app_user()
+        ensure_replication_user_if_needed()
+        create_plain_schema()
+    end)
 
-rawset(_G, 'truncate_local', function()
-    box.space[space_name]:truncate()
-    return box.space[space_name]:len()
-end)
-
-rawset(_G, 'put', function(key, value)
-    local uri = storage_uri_for_key(key)
-
-    if uri ~= nil then
-        return remote_call(uri, 'put_local', {key, value})
+    if read_only then
+        box.cfg{read_only = true}
     end
 
-    return box.space[space_name]:replace{key, value}
-end)
+    rawset(_G, 'put_local', function(key, value)
+        return box.space[space_name]:replace{key, value}
+    end)
 
-rawset(_G, 'get', function(key)
-    local uri = storage_uri_for_key(key)
+    rawset(_G, 'get_local', function(key)
+        return box.space[space_name]:get{key}
+    end)
 
-    if uri ~= nil then
-        return remote_call(uri, 'get_local', {key})
-    end
+    rawset(_G, 'truncate_local', function()
+        box.space[space_name]:truncate()
+        return box.space[space_name]:len()
+    end)
 
-    return box.space[space_name]:get{key}
-end)
+    rawset(_G, 'put', function(key, value)
+        local uri = storage_uri_for_key(key)
 
-rawset(_G, 'truncate_kv', function()
-    if #shard_uris > 0 then
-        local result = {}
-
-        for _, uri in ipairs(shard_uris) do
-            table.insert(result, remote_call(uri, 'truncate_local', {}))
+        if uri ~= nil then
+            return remote_call(uri, 'put_local', {key, value})
         end
 
+        return box.space[space_name]:replace{key, value}
+    end)
+
+    rawset(_G, 'get', function(key)
+        local uri = storage_uri_for_key(key)
+
+        if uri ~= nil then
+            return remote_call(uri, 'get_local', {key})
+        end
+
+        return box.space[space_name]:get{key}
+    end)
+
+    rawset(_G, 'truncate_kv', function()
+        if #shard_uris > 0 then
+            local result = {}
+
+            for _, uri in ipairs(shard_uris) do
+                table.insert(result, remote_call(uri, 'truncate_local', {}))
+            end
+
+            return result
+        end
+
+        box.space[space_name]:truncate()
+        return box.space[space_name]:len()
+    end)
+end
+
+local function start_vshard()
+    local vshard = require('vshard')
+    -- Tarantool 3.x net.box resolves vshard persistent functions through _G.
+    rawset(_G, 'vshard', vshard)
+    local vshard_cfg = dofile('/opt/tarantool/vshard_cfg.lua')
+
+    if vshard_role == 'storage' then
+        if instance_uuid == '' then
+            error('TARANTOOL_INSTANCE_UUID is required for vshard storage')
+        end
+
+        if replicaset_uuid == '' then
+            error('TARANTOOL_REPLICASET_UUID is required for vshard storage')
+        end
+
+        local storage_cfg = {
+            listen = '0.0.0.0:3301',
+
+            memtx_memory = memtx_memory,
+            wal_mode = wal_mode,
+
+            memtx_dir = '/var/lib/tarantool',
+            vinyl_dir = '/var/lib/tarantool',
+
+            read_only = false,
+
+            instance_uuid = instance_uuid,
+            replicaset_uuid = replicaset_uuid,
+        }
+
+        box.cfg(storage_cfg)
+
+        box.once('bootstrap_users_v1', function()
+            ensure_app_user()
+        end)
+
+        box.once('bootstrap_vshard_storage_schema_v1', function()
+            create_vshard_storage_schema()
+        end)
+
+        vshard.storage.cfg(vshard_cfg, instance_uuid)
+
+        rawset(_G, 'put_storage', function(bucket_id, key, value)
+            local tuple = box.space[space_name]:replace{key, bucket_id, value}
+            return {tuple[1], tuple[3]}
+        end)
+
+        rawset(_G, 'get_storage', function(bucket_id, key)
+            local tuple = box.space[space_name]:get{key}
+            if tuple == nil then
+                return nil
+            end
+            return {tuple[1], tuple[3]}
+        end)
+
+        rawset(_G, 'truncate_storage', function()
+            box.space[space_name]:truncate()
+            return box.space[space_name]:len()
+        end)
+
+        return
+    end
+
+    if vshard_role ~= 'router' then
+        error('Unknown TARANTOOL_VSHARD_ROLE: ' .. tostring(vshard_role))
+    end
+
+    box.cfg(cfg)
+
+    box.once('bootstrap_users_v1', function()
+        ensure_app_user()
+    end)
+
+    vshard.router.cfg(vshard_cfg)
+
+    fiber.create(function()
+        for i = 1, 60 do
+            local ok, err = pcall(function()
+                vshard.router.bootstrap({
+                    timeout = 2,
+                    if_not_bootstrapped = true
+                })
+            end)
+
+            if ok then
+                print('vshard bootstrap completed or already done')
+                return
+            end
+
+            print('vshard bootstrap retry ' .. tostring(i) .. ': ' .. tostring(err))
+            fiber.sleep(1)
+        end
+    end)
+
+    local function bucket_id_for_key(key)
+        key = tostring(key)
+        if vshard.router.bucket_id_strcrc32 ~= nil then
+            return vshard.router.bucket_id_strcrc32(key)
+        end
+        return vshard.router.bucket_id(key)
+    end
+
+    local function call_vshard(bucket_id, mode, func_name, args)
+        local result, err = vshard.router.call(bucket_id, mode, func_name, args)
+        if err ~= nil then
+            if type(err) == 'table' and err.message ~= nil then
+                error(err.message)
+            end
+            error(tostring(err))
+        end
         return result
     end
 
-    box.space[space_name]:truncate()
-    return box.space[space_name]:len()
-end)
+    rawset(_G, 'put', function(key, value)
+        local bucket_id = bucket_id_for_key(key)
+        return call_vshard(
+            bucket_id,
+            'write',
+            'put_storage',
+            {bucket_id, key, value}
+        )
+    end)
+
+    rawset(_G, 'get', function(key)
+        local bucket_id = bucket_id_for_key(key)
+        return call_vshard(
+            bucket_id,
+            'read',
+            'get_storage',
+            {bucket_id, key}
+        )
+    end)
+
+    rawset(_G, 'truncate_kv', function()
+        local result = {}
+
+        for _, replicaset in pairs(vshard_cfg.sharding) do
+            for _, replica in pairs(replicaset.replicas) do
+                if replica.master then
+                    local c = net_box.connect(replica.uri, {
+                        wait_connected = false
+                    })
+
+                    if not c:wait_connected(5) then
+                        error('Cannot connect to ' .. replica.uri .. ': ' .. tostring(c.error))
+                    end
+
+                    table.insert(result, c:call('truncate_storage', {}))
+                    c:close()
+                end
+            end
+        end
+
+        return result
+    end)
+end
+
+if is_vshard then
+    start_vshard()
+else
+    start_plain_or_manual_sharding()
+end
 
 print('Tarantool node started')
 print('node=' .. node_name)
 print('topology=' .. topology)
 print('role=' .. role)
+print('vshard_role=' .. tostring(vshard_role))
 print('read_only=' .. tostring(read_only))
 print('space=' .. space_name)
 print('wal_mode=' .. wal_mode)
@@ -772,16 +1073,44 @@ EOF2
         echo "Using prepared Tarantool Dockerfile: $src"
         cp "$src" "$PROJECT_DIR/tarantool/Dockerfile"
     else
-        cat > "$PROJECT_DIR/tarantool/Dockerfile" <<'EOF2'
+        if tarantool_is_vshard_topology; then
+            cat > "$PROJECT_DIR/tarantool/Dockerfile" <<EOF2
 FROM tarantool/tarantool:3
 
+# The official tarantool/tarantool image may not include tt, tarantoolctl or luarocks.
+# For the benchmark stand we install vshard by copying the Lua module from
+# the official GitHub release archive. This avoids exit code 127 during build.
+ADD https://github.com/tarantool/vshard/archive/refs/tags/${TARANTOOL_VSHARD_VERSION}.tar.gz /tmp/vshard.tar.gz
+
+RUN set -eux; \
+    mkdir -p /tmp/vshard-src /usr/local/share/tarantool; \
+    tar -xzf /tmp/vshard.tar.gz -C /tmp/vshard-src --strip-components=1; \
+    cp -R /tmp/vshard-src/vshard /usr/local/share/tarantool/vshard; \
+    env -u TT_APP_NAME -u TT_INSTANCE_NAME -u TT_CONFIG -u TT_CONFIG_ETCD_ENDPOINTS \
+        tarantool -e "local vshard = require('vshard'); print('vshard installed', vshard._VERSION)"; \
+    rm -rf /tmp/vshard.tar.gz /tmp/vshard-src
+
 COPY init.lua /opt/tarantool/init.lua
+COPY vshard_cfg.lua /opt/tarantool/vshard_cfg.lua
 COPY start.sh /usr/local/bin/start-tarantool-single
 
 RUN chmod +x /usr/local/bin/start-tarantool-single
 
 ENTRYPOINT ["/usr/local/bin/start-tarantool-single"]
 EOF2
+        else
+            cat > "$PROJECT_DIR/tarantool/Dockerfile" <<'EOF2'
+FROM tarantool/tarantool:3
+
+COPY init.lua /opt/tarantool/init.lua
+COPY vshard_cfg.lua /opt/tarantool/vshard_cfg.lua
+COPY start.sh /usr/local/bin/start-tarantool-single
+
+RUN chmod +x /usr/local/bin/start-tarantool-single
+
+ENTRYPOINT ["/usr/local/bin/start-tarantool-single"]
+EOF2
+        fi
     fi
 }
 
@@ -1257,6 +1586,94 @@ EOF2
                 done
             done
             ;;
+
+        vshard2|vshard3|vshard4)
+            local shards
+            shards="$(tarantool_vshard_shard_count)"
+
+            cat >> "$PROJECT_DIR/docker-compose.yml" <<EOF2
+  tarantool-vshard-router:
+    build:
+      context: ./tarantool
+      dockerfile: Dockerfile
+    image: ${TARANTOOL_IMAGE}
+    container_name: tarantool-vshard-router
+    depends_on:
+EOF2
+
+            for shard in $(seq 1 "$shards"); do
+                cat >> "$PROJECT_DIR/docker-compose.yml" <<EOF2
+      - tarantool-vshard-storage-${shard}
+EOF2
+            done
+
+            cat >> "$PROJECT_DIR/docker-compose.yml" <<EOF2
+    environment:
+      TARANTOOL_NODE_NAME: tarantool-vshard-router
+      TARANTOOL_TOPOLOGY: ${TARANTOOL_TOPOLOGY}
+      TARANTOOL_ROLE: router
+      TARANTOOL_VSHARD_ROLE: router
+      TARANTOOL_READ_ONLY: "false"
+      TARANTOOL_USER: ${TARANTOOL_USER}
+      TARANTOOL_PASSWORD: ${TARANTOOL_PASSWORD}
+      TARANTOOL_SPACE: ${TARANTOOL_SPACE}
+      TARANTOOL_MEMTX_MEMORY: "${TARANTOOL_MEMTX_MEMORY}"
+      TARANTOOL_WAL_MODE: ${TARANTOOL_WAL_MODE}
+    ports:
+      - "${TARANTOOL_PORT}:3301"
+    volumes:
+      - tarantool-vshard-router-data:/var/lib/tarantool
+    networks:
+      - ${NETWORK_NAME}
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "${TARANTOOL_ROUTER_CPU_LIMIT}"
+          memory: ${TARANTOOL_MEMORY_LIMIT}
+
+EOF2
+
+            for shard in $(seq 1 "$shards"); do
+                local host_port=$((TARANTOOL_PORT + shard))
+                local instance_uuid
+                instance_uuid=$(printf '22222222-2222-2222-2222-%012d' "$shard")
+
+                cat >> "$PROJECT_DIR/docker-compose.yml" <<EOF2
+  tarantool-vshard-storage-${shard}:
+    build:
+      context: ./tarantool
+      dockerfile: Dockerfile
+    image: ${TARANTOOL_IMAGE}
+    container_name: tarantool-vshard-storage-${shard}
+    environment:
+      TARANTOOL_NODE_NAME: tarantool-vshard-storage-${shard}
+      TARANTOOL_TOPOLOGY: ${TARANTOOL_TOPOLOGY}
+      TARANTOOL_ROLE: storage
+      TARANTOOL_VSHARD_ROLE: storage
+      TARANTOOL_INSTANCE_UUID: "${instance_uuid}"
+      TARANTOOL_READ_ONLY: "false"
+      TARANTOOL_USER: ${TARANTOOL_USER}
+      TARANTOOL_PASSWORD: ${TARANTOOL_PASSWORD}
+      TARANTOOL_SPACE: ${TARANTOOL_SPACE}
+      TARANTOOL_MEMTX_MEMORY: "${TARANTOOL_MEMTX_MEMORY}"
+      TARANTOOL_WAL_MODE: ${TARANTOOL_WAL_MODE}
+    ports:
+      - "${host_port}:3301"
+    volumes:
+      - tarantool-vshard-storage-${shard}-data:/var/lib/tarantool
+    networks:
+      - ${NETWORK_NAME}
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "${TARANTOOL_STORAGE_CPU_LIMIT}"
+          memory: ${TARANTOOL_MEMORY_LIMIT}
+
+EOF2
+            done
+            ;;
     esac
 }
 
@@ -1448,6 +1865,18 @@ EOF2
   tarantool-s2-r1-data:
   tarantool-s2-r2-data:
 EOF2
+                ;;
+            vshard2|vshard3|vshard4)
+                cat >> "$PROJECT_DIR/docker-compose.yml" <<EOF2
+  tarantool-vshard-router-data:
+EOF2
+                local shards
+                shards="$(tarantool_vshard_shard_count)"
+                for shard in $(seq 1 "$shards"); do
+                    cat >> "$PROJECT_DIR/docker-compose.yml" <<EOF2
+  tarantool-vshard-storage-${shard}-data:
+EOF2
+                done
                 ;;
         esac
     fi
@@ -1785,6 +2214,15 @@ tarantool_containers_for_topology() {
         sharding_replication4)
             echo "tarantool-s1-r1 tarantool-s1-r2 tarantool-s2-r1 tarantool-s2-r2"
             ;;
+        vshard2|vshard3|vshard4)
+            local shards
+            shards="$(tarantool_vshard_shard_count)"
+            local containers="tarantool-vshard-router"
+            for shard in $(seq 1 "$shards"); do
+                containers="${containers} tarantool-vshard-storage-${shard}"
+            done
+            echo "$containers"
+            ;;
     esac
 }
 
@@ -1794,6 +2232,7 @@ tarantool_check_container() {
         replication2|replication4) echo "tarantool-master" ;;
         sharding2|sharding4) echo "tarantool-shard-1" ;;
         sharding_replication4) echo "tarantool-s1-r1" ;;
+        vshard2|vshard3|vshard4) echo "tarantool-vshard-router" ;;
     esac
 }
 
@@ -2071,6 +2510,16 @@ print_tarantool_summary() {
                     local node_index=$(((shard - 1) * 2 + replica))
                     echo "  shard ${shard} ${role}: localhost:$((TARANTOOL_PORT + node_index - 1)), container: tarantool-s${shard}-r${replica}"
                 done
+            done
+            ;;
+        vshard2|vshard3|vshard4)
+            echo "  mode: vshard router + storage nodes"
+            echo "  bucket_count: ${TARANTOOL_VSHARD_BUCKET_COUNT}"
+            echo "  router: localhost:${TARANTOOL_PORT}, container: tarantool-vshard-router, cpu: ${TARANTOOL_ROUTER_CPU_LIMIT}"
+            local shards
+            shards="$(tarantool_vshard_shard_count)"
+            for shard in $(seq 1 "$shards"); do
+                echo "  storage ${shard}: localhost:$((TARANTOOL_PORT + shard)), container: tarantool-vshard-storage-${shard}, cpu: ${TARANTOOL_STORAGE_CPU_LIMIT}"
             done
             ;;
     esac

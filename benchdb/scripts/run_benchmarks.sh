@@ -44,9 +44,12 @@ set -euo pipefail
 # Tarantool variables:
 #
 #   TARANTOOL_ADDR           default: 127.0.0.1:3301
+#   TARANTOOL_ADDRS          comma-separated router addresses; overrides TARANTOOL_ADDR when set
 #   TARANTOOL_USER           default: app
 #   TARANTOOL_PASSWORD       default: app_pass
 #   TARANTOOL_SPACE          default: kv
+#   TARANTOOL_MODE           direct, call, vshard or crud; default: direct
+#   TARANTOOL_MAX_CONNS      client connections; 0 means benchmark concurrency
 #   TARANTOOL_NO_DDL         1 to add --tarantool-no-ddl; default: 1
 #
 # YDB variables:
@@ -83,9 +86,12 @@ REDIS_PASSWORD="${REDIS_PASSWORD:-}"
 REDIS_DB="${REDIS_DB:-0}"
 
 TARANTOOL_ADDR="${TARANTOOL_ADDR:-127.0.0.1:3301}"
+TARANTOOL_ADDRS="${TARANTOOL_ADDRS:-}"
 TARANTOOL_USER="${TARANTOOL_USER:-app}"
 TARANTOOL_PASSWORD="${TARANTOOL_PASSWORD:-app_pass}"
 TARANTOOL_SPACE="${TARANTOOL_SPACE:-kv}"
+TARANTOOL_MODE="${TARANTOOL_MODE:-direct}"
+TARANTOOL_MAX_CONNS="${TARANTOOL_MAX_CONNS:-0}"
 TARANTOOL_NO_DDL="${TARANTOOL_NO_DDL:-1}"
 
 YDB_CONNECTION_STRING="${YDB_CONNECTION_STRING:-grpc://localhost:2136/local}"
@@ -146,6 +152,8 @@ build_common_flags() {
     --tarantool-user "$TARANTOOL_USER"
     --tarantool-password "$TARANTOOL_PASSWORD"
     --tarantool-space "$TARANTOOL_SPACE"
+    --tarantool-mode "$TARANTOOL_MODE"
+    --tarantool-max-conns "$TARANTOOL_MAX_CONNS"
 
     --ydb-connection-string "$YDB_CONNECTION_STRING"
     --ydb-table "$YDB_TABLE"
@@ -161,6 +169,10 @@ build_common_flags() {
 
   if [[ -n "$REDIS_PASSWORD" ]]; then
     COMMON_FLAGS+=(--redis-password "$REDIS_PASSWORD")
+  fi
+
+  if [[ -n "$TARANTOOL_ADDRS" ]]; then
+    COMMON_FLAGS+=(--tarantool-addrs "$TARANTOOL_ADDRS")
   fi
 
   if is_true "$TARANTOOL_NO_DDL"; then
@@ -202,8 +214,11 @@ redis_db=$REDIS_DB
 redis_password_set=$([[ -n "$REDIS_PASSWORD" ]] && echo yes || echo no)
 
 tarantool_addr=$TARANTOOL_ADDR
+tarantool_addrs=$TARANTOOL_ADDRS
 tarantool_user=$TARANTOOL_USER
 tarantool_space=$TARANTOOL_SPACE
+tarantool_mode=$TARANTOOL_MODE
+tarantool_max_conns=$TARANTOOL_MAX_CONNS
 tarantool_no_ddl=$TARANTOOL_NO_DDL
 
 ydb_connection_string=$YDB_CONNECTION_STRING
@@ -230,6 +245,7 @@ run_scenario() {
   echo "Running scenario: $name"
   echo "Target:          $TARGET"
   echo "Redis mode:      $REDIS_MODE"
+  echo "Tarantool addrs: ${TARANTOOL_ADDRS:-$TARANTOOL_ADDR}"
   echo "Output:          $output_file"
   echo "Log:             $log_file"
   echo "============================================================"
@@ -277,7 +293,7 @@ run_standard() {
     --target "$TARGET" \
     --operation all \
     --requests 100000 \
-    --concurrency-list 1,2,4,8,16,32,64,128,256,512,1024 \
+    --concurrency-list 1,2,4,8,16,32,64,128,256 \
     --value-size 128
 
   run_scenario "03_value_size_scaling" \
@@ -285,7 +301,7 @@ run_standard() {
     --operation all \
     --requests 100000 \
     --concurrency 64 \
-    --value-size-list 64,128,512,1024,4096
+    --value-size-list 16,64,128,512,1024
 }
 
 run_scaling() {
@@ -367,6 +383,7 @@ main() {
   echo "Scenario group:    $SCENARIO_GROUP"
   echo "Target:            $TARGET"
   echo "Redis mode:        $REDIS_MODE"
+  echo "Tarantool addrs:   ${TARANTOOL_ADDRS:-$TARANTOOL_ADDR}"
 
   if [[ "$REDIS_MODE" == "cluster" ]]; then
     echo "Redis cluster:     $REDIS_CLUSTER_ADDRS"

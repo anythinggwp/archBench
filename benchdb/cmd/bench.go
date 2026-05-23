@@ -34,11 +34,17 @@ type benchFlags struct {
 	redisPassword     string
 	redisDB           int
 
-	tarantoolAddr     string
-	tarantoolUser     string
-	tarantoolPassword string
-	tarantoolSpace    string
-	tarantoolNoDDL    bool
+	tarantoolMode         string
+	tarantoolAddr         string
+	tarantoolAddrs        string
+	tarantoolUser         string
+	tarantoolPassword     string
+	tarantoolSpace        string
+	tarantoolSetFunc      string
+	tarantoolGetFunc      string
+	tarantoolTruncateFunc string
+	tarantoolMaxConns     int
+	tarantoolNoDDL        bool
 
 	ydbConnectionString string
 	ydbTable            string
@@ -78,6 +84,10 @@ var benchCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		tarantoolAddrs, err := parseStringList(flags.tarantoolAddrs)
+		if err != nil {
+			return err
+		}
 		baseCfg := bench.Config{
 			Requests:    flags.requests,
 			Concurrency: flags.concurrency,
@@ -92,11 +102,17 @@ var benchCmd = &cobra.Command{
 				DB:           flags.redisDB,
 			},
 			Tarantool: bench.TarantoolConfig{
-				Addr:        flags.tarantoolAddr,
-				User:        flags.tarantoolUser,
-				Password:    flags.tarantoolPassword,
-				Space:       flags.tarantoolSpace,
-				SkipDDLInit: flags.tarantoolNoDDL,
+				Addr:         flags.tarantoolAddr,
+				Addrs:        tarantoolAddrs,
+				User:         flags.tarantoolUser,
+				Password:     flags.tarantoolPassword,
+				Space:        flags.tarantoolSpace,
+				SkipDDLInit:  flags.tarantoolNoDDL,
+				MaxConns:     flags.tarantoolMaxConns,
+				Mode:         flags.tarantoolMode,
+				SetFunc:      flags.tarantoolSetFunc,
+				GetFunc:      flags.tarantoolGetFunc,
+				TruncateFunc: flags.tarantoolTruncateFunc,
 			},
 			YDB: bench.YDBConfig{
 				ConnectionString: flags.ydbConnectionString,
@@ -246,10 +262,16 @@ func init() {
 	benchCmd.Flags().StringVar(&flags.redisPassword, "redis-password", "", "Redis password")
 	benchCmd.Flags().IntVar(&flags.redisDB, "redis-db", 0, "Redis DB number")
 
-	benchCmd.Flags().StringVar(&flags.tarantoolAddr, "tarantool-addr", "127.0.0.1:3301", "Tarantool address")
+	benchCmd.Flags().StringVar(&flags.tarantoolMode, "tarantool-mode", "direct", "Tarantool access mode: direct, call, vshard or crud")
+	benchCmd.Flags().StringVar(&flags.tarantoolAddr, "tarantool-addr", "127.0.0.1:3301", "Tarantool address; for vshard use router address")
+	benchCmd.Flags().StringVar(&flags.tarantoolAddrs, "tarantool-addrs", "", "comma-separated Tarantool router addresses; overrides --tarantool-addr when set")
 	benchCmd.Flags().StringVar(&flags.tarantoolUser, "tarantool-user", "guest", "Tarantool user")
 	benchCmd.Flags().StringVar(&flags.tarantoolPassword, "tarantool-password", "", "Tarantool password")
-	benchCmd.Flags().StringVar(&flags.tarantoolSpace, "tarantool-space", "kv", "Tarantool space name")
+	benchCmd.Flags().StringVar(&flags.tarantoolSpace, "tarantool-space", "kv", "Tarantool space name; used only in direct mode")
+	benchCmd.Flags().StringVar(&flags.tarantoolSetFunc, "tarantool-set-func", "put", "Tarantool function for SET in call/vshard mode")
+	benchCmd.Flags().StringVar(&flags.tarantoolGetFunc, "tarantool-get-func", "get", "Tarantool function for GET in call/vshard mode")
+	benchCmd.Flags().StringVar(&flags.tarantoolTruncateFunc, "tarantool-truncate-func", "truncate_kv", "Tarantool function used by --cleanup-between-runs in call/vshard mode")
+	benchCmd.Flags().IntVar(&flags.tarantoolMaxConns, "tarantool-max-conns", 0, "Tarantool client connections; 0 means use --concurrency")
 	benchCmd.Flags().BoolVar(&flags.tarantoolNoDDL, "tarantool-no-ddl", false, "do not create Tarantool space/index automatically")
 
 	benchCmd.Flags().StringVar(&flags.ydbConnectionString, "ydb-connection-string", "grpc://localhost:2136/local", "YDB connection string, for example grpc://localhost:2136/local")
