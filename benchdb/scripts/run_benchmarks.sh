@@ -94,7 +94,7 @@ TARANTOOL_MODE="${TARANTOOL_MODE:-direct}"
 TARANTOOL_MAX_CONNS="${TARANTOOL_MAX_CONNS:-0}"
 TARANTOOL_NO_DDL="${TARANTOOL_NO_DDL:-1}"
 
-YDB_CONNECTION_STRING="${YDB_CONNECTION_STRING:-grpc://localhost:2136/local}"
+YDB_CONNECTION_STRING="${YDB_CONNECTION_STRING:-grpc://localhost:2136/Root/test}"
 YDB_TABLE="${YDB_TABLE:-kv}"
 YDB_NO_DDL="${YDB_NO_DDL:-0}"
 
@@ -293,7 +293,7 @@ run_standard() {
     --target "$TARGET" \
     --operation all \
     --requests 100000 \
-    --concurrency-list 1,2,4,8,16,32,64,128,256 \
+    --concurrency-list 1,2,4,8,16,32,64,128,256,512,1024,2048,4096 \
     --value-size 128
 
   run_scenario "03_value_size_scaling" \
@@ -301,7 +301,7 @@ run_standard() {
     --operation all \
     --requests 100000 \
     --concurrency 64 \
-    --value-size-list 16,64,128,512,1024
+    --value-size-list 16,64,128,512,1024,2048,4096
 }
 
 run_scaling() {

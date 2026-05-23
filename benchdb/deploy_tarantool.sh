@@ -737,6 +737,44 @@ ENTRYPOINT ["/usr/local/bin/start-tarantool-vshard"]
 EOF
 }
 
+write_haproxy_cfg() {
+    if ! balancer_enabled; then
+        return 0
+    fi
+
+    log "Writing haproxy.cfg"
+
+    cat > "$PROJECT_DIR/haproxy/haproxy.cfg" <<EOF
+global
+    log stdout format raw local0
+    maxconn 65535
+
+defaults
+    log global
+    mode tcp
+    option tcplog
+    timeout connect 3s
+    timeout client 60s
+    timeout server 60s
+
+frontend tarantool_router_frontend
+    bind *:3301
+    default_backend tarantool_router_backend
+
+backend tarantool_router_backend
+    balance ${TARANTOOL_BALANCER_ALGORITHM}
+    option tcp-check
+    default-server inter 2s fall 3 rise 2
+EOF
+
+    local router
+    for router in $(seq 1 "$ROUTERS"); do
+        cat >> "$PROJECT_DIR/haproxy/haproxy.cfg" <<EOF
+    server router${router} $(router_container "$router"):3301 check
+EOF
+    done
+}
+
 write_router_service() {
     local router="$1"
     local container
@@ -797,6 +835,51 @@ EOF
 EOF
 }
 
+write_balancer_service() {
+    if ! balancer_enabled; then
+        return 0
+    fi
+
+    local router
+
+    cat >> "$PROJECT_DIR/docker-compose.yml" <<EOF
+  ${BALANCER_CONTAINER}:
+    image: ${TARANTOOL_BALANCER_IMAGE}
+    container_name: ${BALANCER_CONTAINER}
+    depends_on:
+EOF
+
+    for router in $(seq 1 "$ROUTERS"); do
+        cat >> "$PROJECT_DIR/docker-compose.yml" <<EOF
+      - $(router_container "$router")
+EOF
+    done
+
+    cat >> "$PROJECT_DIR/docker-compose.yml" <<EOF
+    ports:
+      - "${TARANTOOL_BALANCER_PORT}:3301"
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks:
+      - ${NETWORK_NAME}
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "echo | nc -w 1 127.0.0.1 3301 >/dev/null 2>&1"
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "${TARANTOOL_BALANCER_CPU_LIMIT}"
+          memory: ${TARANTOOL_BALANCER_MEMORY_LIMIT}
+
+EOF
+}
+
 write_compose() {
     log "Writing docker-compose.yml"
 
@@ -811,6 +894,8 @@ EOF
     for router in $(seq 1 "$ROUTERS"); do
         write_router_service "$router"
     done
+
+    write_balancer_service
 
     for shard in $(seq 1 "$SHARDS"); do
         for replica in $(seq 1 "$REPLICAS_PER_SHARD"); do
@@ -890,6 +975,7 @@ write_files() {
     write_router_lua
     write_start_sh
     write_dockerfile
+    write_haproxy_cfg
     write_compose
 }
 
@@ -903,6 +989,8 @@ down() {
             compose down -v --remove-orphans || true
         fi
     fi
+
+    docker rm -f "$BALANCER_CONTAINER" 2>/dev/null || true
 
     local router
     for router in $(seq 1 16); do
@@ -992,7 +1080,7 @@ bootstrap_vshard() {
             unset TT_APP_NAME TT_INSTANCE_NAME TT_CONFIG TT_CONFIG_ETCD_ENDPOINTS
             tarantool -e '
                 local net_box = require(\"net.box\")
-                local c = net_box.connect(\"${TARANTOOL_USER}:${TARANTOOL_PASSWORD}@127.0.0.1:3301\")
+                local c = net_box.connect(\"$(client_container_uri)\")
                 assert(c:wait_connected(5))
                 c:eval([[
                     local vshard = require(\"vshard\")
@@ -1039,7 +1127,7 @@ wait_router_green() {
                 local net_box = require(\"net.box\")
                 local json = require(\"json\")
 
-                local c = net_box.connect(\"${TARANTOOL_USER}:${TARANTOOL_PASSWORD}@127.0.0.1:3301\")
+                local c = net_box.connect(\"$(client_container_uri)\")
                 assert(c:wait_connected(5))
 
                 local state = c:eval([[
@@ -1147,6 +1235,10 @@ verify() {
         wait_container "$(router_container "$router")"
     done
 
+    if balancer_enabled; then
+        wait_container "$BALANCER_CONTAINER"
+    fi
+
     local shard
     local replica
     for shard in $(seq 1 "$SHARDS"); do
@@ -1176,6 +1268,11 @@ verify() {
     for router in $(seq 1 "$ROUTERS"); do
         wait_router_green "$(router_container "$router")"
     done
+
+    if balancer_enabled; then
+        log "Verifying router proxy endpoint"
+        wait_tarantool "$ROUTER_CONTAINER" "$(client_container_uri)"
+    fi
 
     log "Checking storage nodes"
 
@@ -1276,6 +1373,11 @@ logs() {
         compose ps || true
     fi
 
+    if balancer_enabled; then
+        echo
+        docker logs "$BALANCER_CONTAINER" --tail=160 || true
+    fi
+
     local router
     for router in $(seq 1 "$ROUTERS"); do
         echo
@@ -1324,10 +1426,14 @@ Tarantool vshard cluster is ready.
 Project:
   ${PROJECT_DIR}
 
-Routers:
-  addrs:    $(router_host_ports_csv)
+Client endpoint:
+  addr:     $(client_host_addr)
+  proxy:    $(balancer_enabled && echo "enabled (${BALANCER_CONTAINER}, ${TARANTOOL_BALANCER_ALGORITHM})" || echo "disabled")
   user:     ${TARANTOOL_USER}
   password: ${TARANTOOL_PASSWORD}
+
+Routers:
+  host addrs: $(router_host_ports_csv)
   cpu each: ${TARANTOOL_ROUTER_CPU_LIMIT}
 EOF
 
@@ -1366,8 +1472,8 @@ Commands:
 Connect router:
   docker exec -it ${ROUTER_CONTAINER} tt connect 127.0.0.1:3301 -u ${TARANTOOL_USER} -p ${TARANTOOL_PASSWORD}
 
-Run benchmark through all routers:
-  TARANTOOL_MODE=crud TARANTOOL_ADDRS=$(router_host_ports_csv) TARGET=tarantool ./scripts/run_benchmarks.sh
+Run benchmark through client endpoint:
+  TARANTOOL_MODE=crud TARANTOOL_ADDR=$(client_host_addr) TARGET=tarantool ./scripts/run_benchmarks.sh
 
 Connect storage leader of shard 1:
   docker exec -it $(storage_container 1 1) tt connect $(storage_container 1 1):3301 -u ${TARANTOOL_USER} -p ${TARANTOOL_PASSWORD}
