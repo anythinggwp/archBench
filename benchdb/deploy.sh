@@ -62,6 +62,9 @@ set -euo pipefail
 #   POSTGRES_INIT_SQL_FILE=./my-init.sql ./deploy.sh
 #   CUSTOM_COMPOSE_FILE=./docker-compose.yml ./deploy.sh
 #
+# PostgreSQL:
+#   POSTGRES_MAX_CONNECTIONS=100 ./deploy.sh
+#
 # IMPORTANT:
 # - sharding2/sharding4 for Redis are manual independent shards; benchmark must route keys itself.
 # - cluster_* modes are real Redis Cluster; benchmark must use redis.ClusterClient.
@@ -133,15 +136,16 @@ TARANTOOL_VSHARD_VERSION="${TARANTOOL_VSHARD_VERSION:-0.1.40}"
 TARANTOOL_REPLICATION_USER="${TARANTOOL_REPLICATION_USER:-replicator}"
 TARANTOOL_REPLICATION_PASSWORD="${TARANTOOL_REPLICATION_PASSWORD:-replicator_pass}"
 
-POSTGRES_CPU_LIMIT="${POSTGRES_CPU_LIMIT:-1.0}"
-POSTGRES_MEMORY_LIMIT="${POSTGRES_MEMORY_LIMIT:-5G}"
+POSTGRES_CPU_LIMIT="${POSTGRES_CPU_LIMIT:-8.0}"
+POSTGRES_MEMORY_LIMIT="${POSTGRES_MEMORY_LIMIT:-10G}"
 POSTGRES_USER="${POSTGRES_USER:-postgres}"
 POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-postgres}"
 POSTGRES_DB="${POSTGRES_DB:-postgres}"
 POSTGRES_TABLE="${POSTGRES_TABLE:-kv}"
+POSTGRES_MAX_CONNECTIONS="${POSTGRES_MAX_CONNECTIONS:-100}"
 
-YDB_CPU_LIMIT="${YDB_CPU_LIMIT:-1.0}"
-YDB_MEMORY_LIMIT="${YDB_MEMORY_LIMIT:-5G}"
+YDB_CPU_LIMIT="${YDB_CPU_LIMIT:-8.0}"
+YDB_MEMORY_LIMIT="${YDB_MEMORY_LIMIT:-10G}"
 
 # ------------------------------------------------------------
 # Common functions
@@ -222,6 +226,22 @@ validate_topologies() {
             die "Unknown TARANTOOL_TOPOLOGY: $TARANTOOL_TOPOLOGY"
             ;;
     esac
+}
+
+validate_postgres_config() {
+    if ! enabled postgres; then
+        return 0
+    fi
+
+    case "$POSTGRES_MAX_CONNECTIONS" in
+        ''|*[!0-9]*)
+            die "POSTGRES_MAX_CONNECTIONS must be a positive integer, got: $POSTGRES_MAX_CONNECTIONS"
+            ;;
+    esac
+
+    if ((POSTGRES_MAX_CONNECTIONS < 1)); then
+        die "POSTGRES_MAX_CONNECTIONS must be greater than zero, got: $POSTGRES_MAX_CONNECTIONS"
+    fi
 }
 
 resolve_config_file() {
@@ -1690,6 +1710,10 @@ append_postgres_compose() {
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
+    command:
+      - postgres
+      - "-c"
+      - "max_connections=${POSTGRES_MAX_CONNECTIONS}"
     ports:
       - "${POSTGRES_PORT}:5432"
     volumes:
@@ -2355,6 +2379,14 @@ verify_postgres() {
         sleep 1
     done
 
+    local actual_max_connections
+    actual_max_connections="$(docker exec "$POSTGRES_CONTAINER" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SHOW max_connections;")"
+    echo "PostgreSQL max_connections: ${actual_max_connections}"
+
+    if [[ "$actual_max_connections" != "$POSTGRES_MAX_CONNECTIONS" ]]; then
+        die "PostgreSQL max_connections mismatch: expected ${POSTGRES_MAX_CONNECTIONS}, got ${actual_max_connections}"
+    fi
+
     log "PostgreSQL read/write check"
 
     docker exec "$POSTGRES_CONTAINER" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
@@ -2552,6 +2584,7 @@ print_summary() {
         echo "  password: ${POSTGRES_PASSWORD}"
         echo "  database: ${POSTGRES_DB}"
         echo "  table: ${POSTGRES_TABLE}"
+        echo "  max_connections: ${POSTGRES_MAX_CONNECTIONS}"
         echo "  container: ${POSTGRES_CONTAINER}"
         echo "  conn: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@localhost:${POSTGRES_PORT}/${POSTGRES_DB}?sslmode=disable"
     fi
@@ -2573,6 +2606,7 @@ normalize_targets
 normalize_topologies
 validate_targets
 validate_topologies
+validate_postgres_config
 
 log "Run parameters"
 echo "PROJECT_DIR=$PROJECT_DIR"
