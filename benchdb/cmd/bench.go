@@ -3,6 +3,8 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"time"
@@ -13,13 +15,18 @@ import (
 )
 
 type benchFlags struct {
-	target      string
-	operation   string
-	requests    int
-	concurrency int
-	valueSize   int
-	keyPrefix   string
-	timeout     time.Duration
+	target       string
+	operation    string
+	requests     int
+	concurrency  int
+	valueSize    int
+	loadDuration time.Duration
+	keyPrefix    string
+	timeout      time.Duration
+	setMode      string
+
+	versionedSetKeys        int
+	versionedSetChangeEvery int
 
 	runs               int
 	runDelay           time.Duration
@@ -89,11 +96,17 @@ var benchCmd = &cobra.Command{
 			return err
 		}
 		baseCfg := bench.Config{
-			Requests:    flags.requests,
-			Concurrency: flags.concurrency,
-			ValueSize:   flags.valueSize,
-			KeyPrefix:   flags.keyPrefix,
-			Timeout:     flags.timeout,
+			Requests:     flags.requests,
+			Concurrency:  flags.concurrency,
+			ValueSize:    flags.valueSize,
+			LoadDuration: flags.loadDuration,
+			KeyPrefix:    flags.keyPrefix,
+			Timeout:      flags.timeout,
+			SetMode:      flags.setMode,
+
+			VersionedSetKeys:        flags.versionedSetKeys,
+			VersionedSetChangeEvery: flags.versionedSetChangeEvery,
+
 			Redis: bench.RedisConfig{
 				Mode:         flags.redisMode,
 				Addr:         flags.redisAddr,
@@ -136,11 +149,14 @@ var benchCmd = &cobra.Command{
 			return err
 		}
 
-		ctx := context.Background()
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+		defer stop()
+
 		results := make([]bench.Result, 0, len(testConfigs)*len(targets)*len(operations))
 		totalRuns := len(testConfigs) * len(targets) * len(operations)
 		currentRun := 0
 
+	runLoop:
 		for testIndex, cfg := range testConfigs {
 			if err := cfg.Validate(); err != nil {
 				return fmt.Errorf("invalid config for test #%d: %w", testIndex+1, err)
@@ -148,6 +164,10 @@ var benchCmd = &cobra.Command{
 
 			for _, target := range targets {
 				for _, operation := range operations {
+					if ctx.Err() != nil {
+						break runLoop
+					}
+
 					currentRun++
 
 					if flags.cleanupBetweenRuns {
@@ -161,17 +181,32 @@ var benchCmd = &cobra.Command{
 					}
 
 					if flags.print {
-						fmt.Fprintf(cmd.OutOrStdout(),
-							"Running %d/%d: test=%d target=%s operation=%s requests=%d concurrency=%d value_size=%d\n",
-							currentRun,
-							totalRuns,
-							cfg.Run,
-							target,
-							operation,
-							cfg.Requests,
-							cfg.Concurrency,
-							cfg.ValueSize,
-						)
+						if cfg.LoadDuration > 0 {
+							fmt.Fprintf(cmd.OutOrStdout(),
+								"Running %d/%d: test=%d target=%s operation=%s load_duration=%s keyspace=%d concurrency=%d value_size=%d\n",
+								currentRun,
+								totalRuns,
+								cfg.Run,
+								target,
+								operation,
+								cfg.LoadDuration,
+								cfg.Requests,
+								cfg.Concurrency,
+								cfg.ValueSize,
+							)
+						} else {
+							fmt.Fprintf(cmd.OutOrStdout(),
+								"Running %d/%d: test=%d target=%s operation=%s requests=%d concurrency=%d value_size=%d\n",
+								currentRun,
+								totalRuns,
+								cfg.Run,
+								target,
+								operation,
+								cfg.Requests,
+								cfg.Concurrency,
+								cfg.ValueSize,
+							)
+						}
 					}
 
 					var result bench.Result
@@ -195,6 +230,9 @@ var benchCmd = &cobra.Command{
 					}
 
 					results = append(results, result)
+					if ctx.Err() != nil {
+						break runLoop
+					}
 
 					if flags.runDelay > 0 && currentRun < totalRuns {
 						time.Sleep(flags.runDelay)
@@ -231,8 +269,12 @@ func init() {
 	benchCmd.Flags().IntVar(&flags.requests, "requests", 10000, "total operations per benchmark")
 	benchCmd.Flags().IntVar(&flags.concurrency, "concurrency", 16, "number of parallel workers")
 	benchCmd.Flags().IntVar(&flags.valueSize, "value-size", 128, "value size in bytes")
+	benchCmd.Flags().DurationVar(&flags.loadDuration, "load-duration", 0, "load testing mode: run each benchmark for this duration; --requests becomes keyspace size")
 	benchCmd.Flags().StringVar(&flags.keyPrefix, "key-prefix", "bench", "key prefix")
 	benchCmd.Flags().DurationVar(&flags.timeout, "timeout", 5*time.Second, "connection/request timeout")
+	benchCmd.Flags().StringVar(&flags.setMode, "set-mode", "plain", "SET behavior: plain or versioned")
+	benchCmd.Flags().IntVar(&flags.versionedSetKeys, "versioned-set-keys", 1000, "keyspace size for --set-mode=versioned")
+	benchCmd.Flags().IntVar(&flags.versionedSetChangeEvery, "versioned-set-change-every", 5, "number of repeated writes per key before version changes")
 
 	benchCmd.Flags().IntVar(&flags.runs, "runs", 1, "repeat every generated benchmark configuration N times")
 	benchCmd.Flags().DurationVar(&flags.runDelay, "run-delay", 0, "pause between sequential benchmark runs, for example 1s or 500ms")
@@ -262,9 +304,9 @@ func init() {
 	benchCmd.Flags().StringVar(&flags.redisPassword, "redis-password", "", "Redis password")
 	benchCmd.Flags().IntVar(&flags.redisDB, "redis-db", 0, "Redis DB number")
 
-	benchCmd.Flags().StringVar(&flags.tarantoolMode, "tarantool-mode", "direct", "Tarantool access mode: direct, call, vshard or crud")
-	benchCmd.Flags().StringVar(&flags.tarantoolAddr, "tarantool-addr", "127.0.0.1:3301", "Tarantool address; for vshard use router address")
-	benchCmd.Flags().StringVar(&flags.tarantoolAddrs, "tarantool-addrs", "", "comma-separated Tarantool router addresses; overrides --tarantool-addr when set")
+	benchCmd.Flags().StringVar(&flags.tarantoolMode, "tarantool-mode", "direct", "Tarantool access mode: direct, cluster, call, vshard or crud")
+	benchCmd.Flags().StringVar(&flags.tarantoolAddr, "tarantool-addr", "127.0.0.1:3301", "Tarantool address; for vshard use router/proxy address")
+	benchCmd.Flags().StringVar(&flags.tarantoolAddrs, "tarantool-addrs", "", "comma-separated Tarantool addresses; in cluster mode keys are routed by hash")
 	benchCmd.Flags().StringVar(&flags.tarantoolUser, "tarantool-user", "guest", "Tarantool user")
 	benchCmd.Flags().StringVar(&flags.tarantoolPassword, "tarantool-password", "", "Tarantool password")
 	benchCmd.Flags().StringVar(&flags.tarantoolSpace, "tarantool-space", "kv", "Tarantool space name; used only in direct mode")
@@ -288,7 +330,7 @@ func init() {
 	benchCmd.Flags().StringVar(&flags.postgreDB, "postgres-db", "postgres", "PostgreSQL database")
 
 	benchCmd.Flags().BoolVar(&flags.print, "print", true, "print results to terminal")
-	benchCmd.Flags().BoolVar(&flags.summary, "summary", false, "print and save aggregated summary grouped by target, operation, requests, concurrency and value-size")
+	benchCmd.Flags().BoolVar(&flags.summary, "summary", false, "print and save aggregated summary grouped by target, operation, requests, concurrency, value-size and load-duration")
 	benchCmd.Flags().StringVar(&flags.outputFile, "output-file", "", "write results to file; empty means disabled")
 	benchCmd.Flags().StringVar(&flags.fileFormat, "file-format", "json", "file format: json, csv")
 }

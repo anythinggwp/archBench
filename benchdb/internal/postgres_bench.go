@@ -67,7 +67,7 @@ func runPostgresSet(ctx context.Context, pool *pgxpool.Pool, cfg Config) Result 
 		table,
 	)
 
-	return runMeasured(TargetPostgres, OperationSet, cfg, func(key string, value string) error {
+	return runMeasured(ctx, TargetPostgres, OperationSet, cfg, func(key string, value string) error {
 		_, err := pool.Exec(ctx, query, key, value)
 		return err
 	})
@@ -77,7 +77,7 @@ func runPostgresGet(ctx context.Context, pool *pgxpool.Pool, cfg Config) Result 
 	table := quotePostgresIdentifier(cfg.Postgres.Table)
 	query := fmt.Sprintf(`SELECT value FROM %s WHERE key = $1`, table)
 
-	return runMeasured(TargetPostgres, OperationGet, cfg, func(key string, value string) error {
+	return runMeasured(ctx, TargetPostgres, OperationGet, cfg, func(key string, value string) error {
 		var got string
 		err := pool.QueryRow(ctx, query, key).Scan(&got)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -95,7 +95,10 @@ func preloadPostgres(ctx context.Context, pool *pgxpool.Pool, cfg Config) error 
 		table,
 	)
 
-	result := runMeasured(TargetPostgres, OperationGet, cfg, func(key string, _ string) error {
+	preloadCfg := cfg
+	preloadCfg.LoadDuration = 0
+
+	result := runMeasured(ctx, TargetPostgres, OperationGet, preloadCfg, func(key string, _ string) error {
 		_, err := pool.Exec(ctx, query, key, value)
 		return err
 	})

@@ -3,6 +3,7 @@ package internal
 import (
 	"context"
 	"fmt"
+	"hash/crc32"
 	"strings"
 	"sync/atomic"
 
@@ -12,19 +13,13 @@ import (
 func RunTarantool(ctx context.Context, cfg Config, operation Operation) (Result, error) {
 	mode := normalizeTarantoolMode(cfg.Tarantool.Mode)
 
-	if mode == "direct" && !cfg.Tarantool.SkipDDLInit {
-		conn, err := connectTarantool(ctx, cfg)
-		if err != nil {
+	if (mode == "direct" || mode == "cluster") && !cfg.Tarantool.SkipDDLInit {
+		if err := ensureTarantoolSpaces(ctx, cfg); err != nil {
 			return Result{}, err
 		}
-		if err := ensureTarantoolSpace(conn, cfg.Tarantool.Space); err != nil {
-			conn.Close()
-			return Result{}, err
-		}
-		conn.Close()
 	}
 
-	connPool, err := newTarantoolConnPool(ctx, cfg)
+	connPool, err := newTarantoolBenchmarkConnPool(ctx, cfg, mode)
 	if err != nil {
 		return Result{}, err
 	}
@@ -32,12 +27,24 @@ func RunTarantool(ctx context.Context, cfg Config, operation Operation) (Result,
 
 	switch operation {
 	case OperationSet:
-		return runTarantoolSet(connPool, cfg, mode), nil
+		if normalizeSetMode(cfg.SetMode) == "versioned" {
+			return runTarantoolVersionedSet(ctx, connPool, cfg, mode), nil
+		}
+		if mode == "cluster" {
+			return runTarantoolClusterSet(ctx, connPool, cfg), nil
+		}
+		return runTarantoolSet(ctx, connPool, cfg, mode), nil
 	case OperationGet:
-		if err := preloadTarantool(connPool, cfg, mode); err != nil {
+		if mode == "cluster" {
+			if err := preloadTarantoolCluster(ctx, connPool, cfg); err != nil {
+				return Result{}, err
+			}
+			return runTarantoolClusterGet(ctx, connPool, cfg), nil
+		}
+		if err := preloadTarantool(ctx, connPool, cfg, mode); err != nil {
 			return Result{}, err
 		}
-		return runTarantoolGet(connPool, cfg, mode), nil
+		return runTarantoolGet(ctx, connPool, cfg, mode), nil
 	default:
 		return Result{}, fmt.Errorf("unsupported tarantool operation: %s", operation)
 	}
@@ -48,27 +55,30 @@ type tarantoolDoer interface {
 }
 
 type tarantoolConnPool struct {
-	conns []*tarantool.Connection
-	next  uint64
+	conns     []*tarantool.Connection
+	next      uint64
+	shards    [][]*tarantool.Connection
+	shardNext []uint64
+}
+
+func newTarantoolBenchmarkConnPool(ctx context.Context, cfg Config, mode string) (*tarantoolConnPool, error) {
+	if mode == "cluster" {
+		return newTarantoolClusterConnPool(ctx, cfg)
+	}
+
+	return newTarantoolConnPool(ctx, cfg)
 }
 
 func newTarantoolConnPool(ctx context.Context, cfg Config) (*tarantoolConnPool, error) {
-	maxConns := cfg.Tarantool.MaxConns
-	if maxConns <= 0 {
-		maxConns = cfg.Concurrency
-	}
-	if maxConns > cfg.Requests {
-		maxConns = cfg.Requests
-	}
-	if maxConns < 1 {
-		maxConns = 1
+	maxConns := tarantoolMaxConns(cfg)
+	addrs := tarantoolAddrs(cfg)
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("tarantool address list is empty")
 	}
 
 	pool := &tarantoolConnPool{
 		conns: make([]*tarantool.Connection, 0, maxConns),
 	}
-
-	addrs := tarantoolAddrs(cfg)
 
 	for i := 0; i < maxConns; i++ {
 		addr := addrs[i%len(addrs)]
@@ -83,16 +93,72 @@ func newTarantoolConnPool(ctx context.Context, cfg Config) (*tarantoolConnPool, 
 	return pool, nil
 }
 
+func newTarantoolClusterConnPool(ctx context.Context, cfg Config) (*tarantoolConnPool, error) {
+	addrs := tarantoolAddrs(cfg)
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("tarantool cluster mode requires at least one address")
+	}
+
+	maxConns := tarantoolMaxConns(cfg)
+	if maxConns < len(addrs) {
+		maxConns = len(addrs)
+	}
+
+	pool := &tarantoolConnPool{
+		conns:     make([]*tarantool.Connection, 0, maxConns),
+		shards:    make([][]*tarantool.Connection, len(addrs)),
+		shardNext: make([]uint64, len(addrs)),
+	}
+
+	for i := 0; i < maxConns; i++ {
+		shardIdx := i % len(addrs)
+		addr := addrs[shardIdx]
+		conn, err := connectTarantoolAddr(ctx, cfg, addr)
+		if err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("tarantool cluster connect %d/%d to shard %d (%s) failed: %w", i+1, maxConns, shardIdx, addr, err)
+		}
+		pool.conns = append(pool.conns, conn)
+		pool.shards[shardIdx] = append(pool.shards[shardIdx], conn)
+	}
+
+	return pool, nil
+}
+
+func tarantoolMaxConns(cfg Config) int {
+	maxConns := cfg.Tarantool.MaxConns
+	if maxConns <= 0 {
+		maxConns = cfg.Concurrency
+	}
+	if maxConns > cfg.Requests {
+		maxConns = cfg.Requests
+	}
+	if maxConns < 1 {
+		maxConns = 1
+	}
+	return maxConns
+}
+
 func connectTarantool(ctx context.Context, cfg Config) (*tarantool.Connection, error) {
-	return connectTarantoolAddr(ctx, cfg, tarantoolAddrs(cfg)[0])
+	addrs := tarantoolAddrs(cfg)
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("tarantool address list is empty")
+	}
+	return connectTarantoolAddr(ctx, cfg, addrs[0])
 }
 
 func tarantoolAddrs(cfg Config) []string {
-	if len(cfg.Tarantool.Addrs) > 0 {
-		return cfg.Tarantool.Addrs
+	addrs := cleanStringList(cfg.Tarantool.Addrs)
+	if len(addrs) > 0 {
+		return addrs
 	}
 
-	return []string{cfg.Tarantool.Addr}
+	addr := strings.TrimSpace(cfg.Tarantool.Addr)
+	if addr == "" {
+		return nil
+	}
+
+	return []string{addr}
 }
 
 func connectTarantoolAddr(ctx context.Context, cfg Config, addr string) (*tarantool.Connection, error) {
@@ -127,17 +193,36 @@ func (p *tarantoolConnPool) Do(req tarantool.Request) *tarantool.Future {
 	return p.conns[int(idx%uint64(len(p.conns)))].Do(req)
 }
 
-func normalizeTarantoolMode(mode string) string {
-	mode = strings.ToLower(strings.TrimSpace(mode))
-	if mode == "" {
-		return "direct"
+func (p *tarantoolConnPool) DoForKey(key string, req tarantool.Request) *tarantool.Future {
+	if len(p.shards) == 0 {
+		return p.Do(req)
 	}
-	return mode
+
+	shardIdx := int(crc32.ChecksumIEEE([]byte(key)) % uint32(len(p.shards)))
+	conns := p.shards[shardIdx]
+	if len(conns) == 1 {
+		return conns[0].Do(req)
+	}
+
+	idx := atomic.AddUint64(&p.shardNext[shardIdx], 1) - 1
+	return conns[int(idx%uint64(len(conns)))].Do(req)
 }
 
-func runTarantoolSet(conn tarantoolDoer, cfg Config, mode string) Result {
+func normalizeTarantoolMode(mode string) string {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	switch mode {
+	case "":
+		return "direct"
+	case "shard", "sharded", "sharding":
+		return "cluster"
+	default:
+		return mode
+	}
+}
+
+func runTarantoolSet(ctx context.Context, conn tarantoolDoer, cfg Config, mode string) Result {
 	space := cfg.Tarantool.Space
-	return runMeasured(TargetTarantool, OperationSet, cfg, func(key string, value string) error {
+	return runMeasured(ctx, TargetTarantool, OperationSet, cfg, func(key string, value string) error {
 		if mode == "crud" {
 			return doTarantoolCrudRequest(
 				conn,
@@ -157,9 +242,9 @@ func runTarantoolSet(conn tarantoolDoer, cfg Config, mode string) Result {
 	})
 }
 
-func runTarantoolGet(conn tarantoolDoer, cfg Config, mode string) Result {
+func runTarantoolGet(ctx context.Context, conn tarantoolDoer, cfg Config, mode string) Result {
 	space := cfg.Tarantool.Space
-	return runMeasured(TargetTarantool, OperationGet, cfg, func(key string, value string) error {
+	return runMeasured(ctx, TargetTarantool, OperationGet, cfg, func(key string, value string) error {
 		if mode == "crud" {
 			return doTarantoolCrudRequest(
 				conn,
@@ -182,11 +267,77 @@ func runTarantoolGet(conn tarantoolDoer, cfg Config, mode string) Result {
 	})
 }
 
-func preloadTarantool(conn tarantoolDoer, cfg Config, mode string) error {
+func runTarantoolClusterSet(ctx context.Context, conn *tarantoolConnPool, cfg Config) Result {
+	space := cfg.Tarantool.Space
+	return runMeasured(ctx, TargetTarantool, OperationSet, cfg, func(key string, value string) error {
+		_, err := conn.DoForKey(key, tarantool.NewReplaceRequest(space).
+			Tuple([]interface{}{key, value}),
+		).Get()
+		return err
+	})
+}
+
+func runTarantoolClusterGet(ctx context.Context, conn *tarantoolConnPool, cfg Config) Result {
+	space := cfg.Tarantool.Space
+	return runMeasured(ctx, TargetTarantool, OperationGet, cfg, func(key string, value string) error {
+		_, err := conn.DoForKey(key, tarantool.NewSelectRequest(space).
+			Index("primary").
+			Iterator(tarantool.IterEq).
+			Limit(1).
+			Key([]interface{}{key}),
+		).Get()
+		return err
+	})
+}
+
+func runTarantoolVersionedSet(ctx context.Context, conn *tarantoolConnPool, cfg Config, mode string) Result {
+	space := cfg.Tarantool.Space
+	return runMeasuredIndexed(ctx, TargetTarantool, OperationSet, cfg, func(idx int) (string, string) {
+		return makeVersionedSetKeyValue(cfg, TargetTarantool, idx)
+	}, func(_ int, key string, value string) error {
+		switch mode {
+		case "cluster":
+			_, err := conn.DoForKey(key, newTarantoolVersionedReplaceRequest(space, key, value)).Get()
+			return err
+
+		case "direct":
+			_, err := conn.Do(newTarantoolVersionedReplaceRequest(space, key, value)).Get()
+			return err
+
+		case "crud":
+			current, found, err := getTarantoolValue(conn, cfg, mode, key)
+			if err != nil {
+				return err
+			}
+			if found && !valueVersionChanged(current, value) {
+				return nil
+			}
+			return doTarantoolCrudRequest(
+				conn,
+				newTarantoolCrudReplaceRequest(space, key, value),
+				"crud.replace",
+			)
+
+		default:
+			current, found, err := getTarantoolValue(conn, cfg, mode, key)
+			if err != nil {
+				return err
+			}
+			if found && !valueVersionChanged(current, value) {
+				return nil
+			}
+			return doTarantoolCall(conn, cfg.Tarantool.SetFunc, []interface{}{key, value})
+		}
+	})
+}
+
+func preloadTarantool(ctx context.Context, conn tarantoolDoer, cfg Config, mode string) error {
 	space := cfg.Tarantool.Space
 	value := strings.Repeat("x", cfg.ValueSize)
+	preloadCfg := cfg
+	preloadCfg.LoadDuration = 0
 
-	result := runMeasured(TargetTarantool, OperationGet, cfg, func(key string, _ string) error {
+	result := runMeasured(ctx, TargetTarantool, OperationGet, preloadCfg, func(key string, _ string) error {
 		if mode == "crud" {
 			return doTarantoolCrudRequest(
 				conn,
@@ -206,6 +357,24 @@ func preloadTarantool(conn tarantoolDoer, cfg Config, mode string) error {
 	})
 	if result.Failed > 0 {
 		return fmt.Errorf("tarantool preload failed: %d errors, first errors: %v", result.Failed, result.SampleErrors)
+	}
+	return nil
+}
+
+func preloadTarantoolCluster(ctx context.Context, conn *tarantoolConnPool, cfg Config) error {
+	space := cfg.Tarantool.Space
+	value := strings.Repeat("x", cfg.ValueSize)
+	preloadCfg := cfg
+	preloadCfg.LoadDuration = 0
+
+	result := runMeasured(ctx, TargetTarantool, OperationGet, preloadCfg, func(key string, _ string) error {
+		_, err := conn.DoForKey(key, tarantool.NewReplaceRequest(space).
+			Tuple([]interface{}{key, value}),
+		).Get()
+		return err
+	})
+	if result.Failed > 0 {
+		return fmt.Errorf("tarantool cluster preload failed: %d errors, first errors: %v", result.Failed, result.SampleErrors)
 	}
 	return nil
 }
@@ -255,6 +424,113 @@ func newTarantoolCrudTruncateRequest(space string) tarantool.Request {
 	})
 }
 
+func newTarantoolVersionedReplaceRequest(space string, key string, value string) tarantool.Request {
+	lua := `
+local space_name, key, value, version_len = ...
+local space = box.space[space_name]
+
+if space == nil then
+    error("space '" .. tostring(space_name) .. "' does not exist")
+end
+
+local current = space:get{key}
+local new_version = string.sub(value, 1, version_len)
+
+if current ~= nil then
+    local current_value = current[2]
+    if current_value ~= nil and string.sub(current_value, 1, version_len) == new_version then
+        return false
+    end
+end
+
+space:replace{key, value}
+return true
+`
+
+	return tarantool.NewEvalRequest(lua).Args([]interface{}{space, key, value, versionedValueHeaderLen})
+}
+
+func getTarantoolValue(conn tarantoolDoer, cfg Config, mode string, key string) (string, bool, error) {
+	var req tarantool.Request
+	funcName := "select"
+
+	switch mode {
+	case "crud":
+		funcName = "crud.get"
+		req = newTarantoolCrudGetRequest(cfg.Tarantool.Space, key)
+
+	case "direct", "cluster":
+		req = tarantool.NewSelectRequest(cfg.Tarantool.Space).
+			Index("primary").
+			Iterator(tarantool.IterEq).
+			Limit(1).
+			Key([]interface{}{key})
+
+	default:
+		funcName = cfg.Tarantool.GetFunc
+		req = tarantool.NewCallRequest(cfg.Tarantool.GetFunc).Args([]interface{}{key})
+	}
+
+	data, err := conn.Do(req).Get()
+	if err != nil {
+		return "", false, err
+	}
+
+	if err := detectTarantoolCallError(funcName, data); err != nil {
+		return "", false, err
+	}
+
+	value, ok := extractTarantoolValue(data)
+	return value, ok, nil
+}
+
+func extractTarantoolValue(v interface{}) (string, bool) {
+	switch x := v.(type) {
+	case nil:
+		return "", false
+
+	case []interface{}:
+		if len(x) >= 3 {
+			if value, ok := stringFromTarantoolValue(x[2]); ok {
+				return value, true
+			}
+		}
+		if len(x) >= 2 {
+			if value, ok := stringFromTarantoolValue(x[1]); ok {
+				return value, true
+			}
+		}
+		for _, item := range x {
+			if value, ok := extractTarantoolValue(item); ok {
+				return value, true
+			}
+		}
+
+	case map[string]interface{}:
+		if rows, ok := x["rows"]; ok {
+			return extractTarantoolValue(rows)
+		}
+
+	case map[interface{}]interface{}:
+		if rows, ok := x["rows"]; ok {
+			return extractTarantoolValue(rows)
+		}
+	}
+
+	return "", false
+}
+
+func stringFromTarantoolValue(v interface{}) (string, bool) {
+	switch x := v.(type) {
+	case string:
+		return x, true
+	case []byte:
+		return string(x), true
+	default:
+		return "", false
+	}
+}
+
 func detectTarantoolCallError(funcName string, data []interface{}) error {
 	if len(data) >= 2 && data[0] == nil && data[1] != nil {
 		return fmt.Errorf("%s returned error: %v", funcName, data[1])
@@ -294,6 +570,24 @@ return true
 	return nil
 }
 
+func ensureTarantoolSpaces(ctx context.Context, cfg Config) error {
+	for _, addr := range tarantoolAddrs(cfg) {
+		conn, err := connectTarantoolAddr(ctx, cfg, addr)
+		if err != nil {
+			return err
+		}
+
+		if err := ensureTarantoolSpace(conn, cfg.Tarantool.Space); err != nil {
+			conn.Close()
+			return fmt.Errorf("tarantool space init on %s failed: %w", addr, err)
+		}
+
+		conn.Close()
+	}
+
+	return nil
+}
+
 func truncateTarantoolSpace(
 	ctx context.Context,
 	conn *tarantool.Connection,
@@ -325,13 +619,38 @@ func truncateTarantoolSpace(
 }
 
 func cleanupTarantool(ctx context.Context, cfg Config) error {
+	mode := normalizeTarantoolMode(cfg.Tarantool.Mode)
+	if mode == "cluster" {
+		for _, addr := range tarantoolAddrs(cfg) {
+			shardConn, err := connectTarantoolAddr(ctx, cfg, addr)
+			if err != nil {
+				return err
+			}
+
+			if !cfg.Tarantool.SkipDDLInit {
+				if err := ensureTarantoolSpace(shardConn, cfg.Tarantool.Space); err != nil {
+					shardConn.Close()
+					return fmt.Errorf("tarantool space init on %s failed: %w", addr, err)
+				}
+			}
+
+			if err := truncateTarantoolSpace(ctx, shardConn, cfg.Tarantool.Space); err != nil {
+				shardConn.Close()
+				return fmt.Errorf("tarantool truncate on %s failed: %w", addr, err)
+			}
+
+			shardConn.Close()
+		}
+
+		return nil
+	}
+
 	conn, err := connectTarantool(ctx, cfg)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
 
-	mode := normalizeTarantoolMode(cfg.Tarantool.Mode)
 	if mode == "direct" && !cfg.Tarantool.SkipDDLInit {
 		if err := ensureTarantoolSpace(conn, cfg.Tarantool.Space); err != nil {
 			return err

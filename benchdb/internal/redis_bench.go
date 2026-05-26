@@ -24,6 +24,9 @@ func RunRedis(ctx context.Context, cfg Config, operation Operation) (Result, err
 
 	switch operation {
 	case OperationSet:
+		if normalizeSetMode(cfg.SetMode) == "versioned" {
+			return runRedisVersionedSet(ctx, client, cfg), nil
+		}
 		return runRedisSet(ctx, client, cfg), nil
 	case OperationGet:
 		if err := preloadRedis(ctx, client, cfg); err != nil {
@@ -36,13 +39,33 @@ func RunRedis(ctx context.Context, cfg Config, operation Operation) (Result, err
 }
 
 func runRedisSet(ctx context.Context, client redis.UniversalClient, cfg Config) Result {
-	return runMeasured(TargetRedis, OperationSet, cfg, func(key string, value string) error {
+	return runMeasured(ctx, TargetRedis, OperationSet, cfg, func(key string, value string) error {
 		return client.Set(ctx, key, value, 0).Err()
 	})
 }
 
+const redisVersionedSetScript = `
+local current = redis.call('GET', KEYS[1])
+local new_version = string.sub(ARGV[1], 1, tonumber(ARGV[2]))
+
+if current ~= false and string.sub(current, 1, tonumber(ARGV[2])) == new_version then
+    return 0
+end
+
+redis.call('SET', KEYS[1], ARGV[1])
+return 1
+`
+
+func runRedisVersionedSet(ctx context.Context, client redis.UniversalClient, cfg Config) Result {
+	return runMeasuredIndexed(ctx, TargetRedis, OperationSet, cfg, func(idx int) (string, string) {
+		return makeVersionedSetKeyValue(cfg, TargetRedis, idx)
+	}, func(_ int, key string, value string) error {
+		return client.Eval(ctx, redisVersionedSetScript, []string{key}, value, versionedValueHeaderLen).Err()
+	})
+}
+
 func runRedisGet(ctx context.Context, client redis.UniversalClient, cfg Config) Result {
-	return runMeasured(TargetRedis, OperationGet, cfg, func(key string, value string) error {
+	return runMeasured(ctx, TargetRedis, OperationGet, cfg, func(key string, value string) error {
 		return client.Get(ctx, key).Err()
 	})
 }
@@ -56,8 +79,9 @@ func preloadRedis(ctx context.Context, client redis.UniversalClient, cfg Config)
 	preloadCfg := cfg
 	preloadCfg.KeyPrefix = cfg.KeyPrefix
 	preloadCfg.Requests = cfg.Requests
+	preloadCfg.LoadDuration = 0
 
-	result := runMeasured(TargetRedis, OperationGet, preloadCfg, func(key string, _ string) error {
+	result := runMeasured(ctx, TargetRedis, OperationGet, preloadCfg, func(key string, _ string) error {
 		return client.Set(ctx, key, string(value), time.Hour).Err()
 	})
 	if result.Failed > 0 {

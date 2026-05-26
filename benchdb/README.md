@@ -114,6 +114,25 @@ The list flags override the single-value flags:
 
 Each generated test receives its own `run` number. The `run` field is printed in the terminal table and written to JSON/CSV output.
 
+## Load testing mode
+
+Use `--load-duration` to generate continuous load for a fixed amount of time.
+In this mode `--requests` is used as the keyspace size, so workers keep cycling over the same keys until the duration expires.
+
+Example: keep Redis GET load running for one minute with 64 workers and a 100k-key keyspace:
+
+```bash
+./dbbench bench \
+  --target redis \
+  --operation get \
+  --requests 100000 \
+  --concurrency 64 \
+  --value-size 128 \
+  --load-duration 1m \
+  --summary
+```
+
+The terminal table and JSON/CSV output include `load_duration`. Press `Ctrl+C` to stop an active run early.
 
 ## Summary mode
 

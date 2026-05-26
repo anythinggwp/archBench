@@ -56,7 +56,7 @@ DECLARE $key AS Utf8;
 DECLARE $value AS Utf8;
 UPSERT INTO %s (`+"`key`"+`, `+"`value`"+`) VALUES ($key, $value);`, ydbIdentifier(cfg.YDB.Table))
 
-	return runMeasured(TargetYDB, OperationSet, cfg, func(key string, value string) error {
+	return runMeasured(ctx, TargetYDB, OperationSet, cfg, func(key string, value string) error {
 		_, err := db.ExecContext(ctx, query,
 			sql.Named("key", types.TextValue(key)),
 			sql.Named("value", types.TextValue(value)),
@@ -70,7 +70,7 @@ func runYDBGet(ctx context.Context, db *sql.DB, cfg Config) Result {
 DECLARE $key AS Utf8;
 SELECT `+"`value`"+` FROM %s WHERE `+"`key`"+` = $key;`, ydbIdentifier(cfg.YDB.Table))
 
-	return runMeasured(TargetYDB, OperationGet, cfg, func(key string, value string) error {
+	return runMeasured(ctx, TargetYDB, OperationGet, cfg, func(key string, value string) error {
 		var got string
 		err := db.QueryRowContext(ctx, query, sql.Named("key", types.TextValue(key))).Scan(&got)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -87,7 +87,10 @@ DECLARE $key AS Utf8;
 DECLARE $value AS Utf8;
 UPSERT INTO %s (`+"`key`"+`, `+"`value`"+`) VALUES ($key, $value);`, ydbIdentifier(cfg.YDB.Table))
 
-	result := runMeasured(TargetYDB, OperationGet, cfg, func(key string, _ string) error {
+	preloadCfg := cfg
+	preloadCfg.LoadDuration = 0
+
+	result := runMeasured(ctx, TargetYDB, OperationGet, preloadCfg, func(key string, _ string) error {
 		_, err := db.ExecContext(ctx, query,
 			sql.Named("key", types.TextValue(key)),
 			sql.Named("value", types.TextValue(value)),

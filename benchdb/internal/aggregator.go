@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -32,12 +33,17 @@ const (
 )
 
 type Config struct {
-	Run         int
-	Requests    int
-	Concurrency int
-	ValueSize   int
-	KeyPrefix   string
-	Timeout     time.Duration
+	Run          int
+	Requests     int
+	Concurrency  int
+	ValueSize    int
+	LoadDuration time.Duration
+	KeyPrefix    string
+	Timeout      time.Duration
+	SetMode      string
+
+	VersionedSetKeys        int
+	VersionedSetChangeEvery int
 
 	Redis     RedisConfig
 	Tarantool TarantoolConfig
@@ -66,6 +72,7 @@ type TarantoolConfig struct {
 	MaxConns    int
 
 	// direct — старый режим через space:replace/get
+	// cluster — client-side sharding over multiple direct Tarantool instances
 	// call   — вызов Lua-функций
 	// vshard — вызов Lua-функций на vshard-router
 	// crud   — вызов официального CRUD API на vshard-router
@@ -100,6 +107,7 @@ type Result struct {
 	Requests     int           `json:"requests"`
 	Concurrency  int           `json:"concurrency"`
 	ValueSize    int           `json:"value_size"`
+	LoadDuration time.Duration `json:"load_duration_ns,omitempty"`
 	Success      int64         `json:"success"`
 	Failed       int64         `json:"failed"`
 	Duration     time.Duration `json:"duration_ns"`
@@ -114,12 +122,13 @@ type Result struct {
 }
 
 type Summary struct {
-	Target      Target    `json:"target"`
-	Operation   Operation `json:"operation"`
-	Requests    int       `json:"requests"`
-	Concurrency int       `json:"concurrency"`
-	ValueSize   int       `json:"value_size"`
-	Runs        int       `json:"runs"`
+	Target       Target        `json:"target"`
+	Operation    Operation     `json:"operation"`
+	Requests     int           `json:"requests"`
+	Concurrency  int           `json:"concurrency"`
+	ValueSize    int           `json:"value_size"`
+	LoadDuration time.Duration `json:"load_duration_ns,omitempty"`
+	Runs         int           `json:"runs"`
 
 	SuccessTotal int64 `json:"success_total"`
 	FailedTotal  int64 `json:"failed_total"`
@@ -162,11 +171,31 @@ func (c Config) Validate() error {
 	if c.ValueSize <= 0 {
 		return errors.New("value-size must be greater than zero")
 	}
+	if c.LoadDuration < 0 {
+		return errors.New("load-duration must not be negative")
+	}
 	if c.Timeout <= 0 {
 		return errors.New("timeout must be greater than zero")
 	}
 	if c.KeyPrefix == "" {
 		return errors.New("key-prefix must not be empty")
+	}
+	setMode := normalizeSetMode(c.SetMode)
+	switch setMode {
+	case "plain", "versioned":
+	default:
+		return fmt.Errorf("invalid set-mode %q: use plain or versioned", c.SetMode)
+	}
+	if setMode == "versioned" {
+		if c.ValueSize < versionedValueHeaderLen {
+			return fmt.Errorf("value-size must be at least %d when set-mode=versioned", versionedValueHeaderLen)
+		}
+		if c.VersionedSetKeys <= 0 {
+			return errors.New("versioned-set-keys must be greater than zero when set-mode=versioned")
+		}
+		if c.VersionedSetChangeEvery <= 0 {
+			return errors.New("versioned-set-change-every must be greater than zero when set-mode=versioned")
+		}
 	}
 	redisMode := strings.ToLower(strings.TrimSpace(c.Redis.Mode))
 	if redisMode == "" {
@@ -206,9 +235,12 @@ func (c Config) Validate() error {
 	}
 	tarantoolMode := normalizeTarantoolMode(c.Tarantool.Mode)
 	switch tarantoolMode {
-	case "direct", "call", "vshard", "crud":
+	case "direct", "cluster", "call", "vshard", "crud":
 	default:
-		return fmt.Errorf("invalid tarantool-mode %q: use direct, call, vshard or crud", c.Tarantool.Mode)
+		return fmt.Errorf("invalid tarantool-mode %q: use direct, cluster, call, vshard or crud", c.Tarantool.Mode)
+	}
+	if tarantoolMode == "cluster" && len(cleanStringList(c.Tarantool.Addrs)) == 0 {
+		return errors.New("tarantool-addrs must not be empty when tarantool-mode=cluster")
 	}
 	if tarantoolMode == "call" || tarantoolMode == "vshard" {
 		if strings.TrimSpace(c.Tarantool.SetFunc) == "" {
@@ -237,10 +269,24 @@ func (c Config) Validate() error {
 }
 
 type operationFunc func(key string, value string) error
+type indexedOperationFunc func(idx int, key string, value string) error
+type keyValueFunc func(idx int) (string, string)
 
-func runMeasured(target Target, operation Operation, cfg Config, fn operationFunc) Result {
-	latencies := make([]time.Duration, cfg.Requests)
+func runMeasured(ctx context.Context, target Target, operation Operation, cfg Config, fn operationFunc) Result {
 	value := strings.Repeat("x", cfg.ValueSize)
+	return runMeasuredIndexed(ctx, target, operation, cfg, func(idx int) (string, string) {
+		return makeKey(cfg.KeyPrefix, target, operation, measuredKeyIndex(cfg, idx)), value
+	}, func(_ int, key string, value string) error {
+		return fn(key, value)
+	})
+}
+
+func runMeasuredIndexed(ctx context.Context, target Target, operation Operation, cfg Config, keyValue keyValueFunc, fn indexedOperationFunc) Result {
+	if cfg.LoadDuration > 0 {
+		return runMeasuredForDuration(ctx, target, operation, cfg, keyValue, fn)
+	}
+
+	latencies := make([]time.Duration, cfg.Requests)
 
 	var next int64
 	var success int64
@@ -257,14 +303,20 @@ func runMeasured(target Target, operation Operation, cfg Config, fn operationFun
 			defer wg.Done()
 
 			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
 				idx := int(atomic.AddInt64(&next, 1) - 1)
 				if idx >= cfg.Requests {
 					return
 				}
 
-				key := makeKey(cfg.KeyPrefix, target, operation, idx)
+				key, value := keyValue(idx)
 				opStartedAt := time.Now()
-				err := fn(key, value)
+				err := fn(idx, key, value)
 				latencies[idx] = time.Since(opStartedAt)
 
 				if err != nil {
@@ -288,6 +340,70 @@ func runMeasured(target Target, operation Operation, cfg Config, fn operationFun
 	return aggregateResult(target, operation, cfg, latencies, totalDuration, success, failed, sampleErrors)
 }
 
+func runMeasuredForDuration(ctx context.Context, target Target, operation Operation, cfg Config, keyValue keyValueFunc, fn indexedOperationFunc) Result {
+	runCtx, cancel := context.WithTimeout(ctx, cfg.LoadDuration)
+	defer cancel()
+
+	var next int64
+	var success int64
+	var failed int64
+	var errMu sync.Mutex
+	sampleErrors := make([]string, 0, 8)
+
+	startedAt := time.Now()
+	latencyCh := make(chan []time.Duration, cfg.Concurrency)
+	var wg sync.WaitGroup
+	wg.Add(cfg.Concurrency)
+
+	for workerID := 0; workerID < cfg.Concurrency; workerID++ {
+		go func() {
+			defer wg.Done()
+
+			localLatencies := make([]time.Duration, 0, 1024)
+			defer func() {
+				latencyCh <- localLatencies
+			}()
+
+			for {
+				select {
+				case <-runCtx.Done():
+					return
+				default:
+				}
+
+				idx := int(atomic.AddInt64(&next, 1) - 1)
+				key, value := keyValue(idx)
+				opStartedAt := time.Now()
+				err := fn(idx, key, value)
+				localLatencies = append(localLatencies, time.Since(opStartedAt))
+
+				if err != nil {
+					atomic.AddInt64(&failed, 1)
+					errMu.Lock()
+					if len(sampleErrors) < cap(sampleErrors) {
+						sampleErrors = append(sampleErrors, err.Error())
+					}
+					errMu.Unlock()
+					continue
+				}
+
+				atomic.AddInt64(&success, 1)
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(latencyCh)
+	totalDuration := time.Since(startedAt)
+
+	var latencies []time.Duration
+	for workerLatencies := range latencyCh {
+		latencies = append(latencies, workerLatencies...)
+	}
+
+	return aggregateResult(target, operation, cfg, latencies, totalDuration, success, failed, sampleErrors)
+}
+
 func aggregateResult(
 	target Target,
 	operation Operation,
@@ -300,15 +416,16 @@ func aggregateResult(
 ) Result {
 	if len(latencies) == 0 {
 		return Result{
-			Run:         cfg.Run,
-			Target:      target,
-			Operation:   operation,
-			Requests:    cfg.Requests,
-			Concurrency: cfg.Concurrency,
-			ValueSize:   cfg.ValueSize,
-			Success:     success,
-			Failed:      failed,
-			Duration:    totalDuration,
+			Run:          cfg.Run,
+			Target:       target,
+			Operation:    operation,
+			Requests:     cfg.Requests,
+			Concurrency:  cfg.Concurrency,
+			ValueSize:    cfg.ValueSize,
+			LoadDuration: cfg.LoadDuration,
+			Success:      success,
+			Failed:       failed,
+			Duration:     totalDuration,
 		}
 	}
 
@@ -332,6 +449,7 @@ func aggregateResult(
 		Requests:     cfg.Requests,
 		Concurrency:  cfg.Concurrency,
 		ValueSize:    cfg.ValueSize,
+		LoadDuration: cfg.LoadDuration,
 		Success:      success,
 		Failed:       failed,
 		Duration:     totalDuration,
@@ -369,20 +487,81 @@ func makeKey(prefix string, target Target, operation Operation, idx int) string 
 	return fmt.Sprintf("%s:%s:%s:%d", prefix, target, operation, idx)
 }
 
+func measuredKeyIndex(cfg Config, idx int) int {
+	if cfg.LoadDuration > 0 && cfg.Requests > 0 {
+		return idx % cfg.Requests
+	}
+	return idx
+}
+
+const versionedValueHeaderLen = len("v=00000000000000000000;")
+
+func normalizeSetMode(mode string) string {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	switch mode {
+	case "", "plain", "normal", "default":
+		return "plain"
+	case "versioned", "version", "if-version-changed":
+		return "versioned"
+	default:
+		return mode
+	}
+}
+
+func makeVersionedSetKeyValue(cfg Config, target Target, idx int) (string, string) {
+	keyCount := cfg.VersionedSetKeys
+	if keyCount <= 0 {
+		keyCount = 1
+	}
+
+	changeEvery := cfg.VersionedSetChangeEvery
+	if changeEvery <= 0 {
+		changeEvery = 1
+	}
+
+	keyIdx := idx % keyCount
+	visit := idx / keyCount
+	version := uint64(visit / changeEvery)
+
+	key := fmt.Sprintf("%s:%s:%s:versioned:%d", cfg.KeyPrefix, target, OperationSet, keyIdx)
+	value := makeVersionedValue(version, cfg.ValueSize)
+	return key, value
+}
+
+func makeVersionedValue(version uint64, size int) string {
+	prefix := fmt.Sprintf("v=%020d;", version)
+	if size <= len(prefix) {
+		return prefix
+	}
+	return prefix + strings.Repeat("x", size-len(prefix))
+}
+
+func valueVersion(value string) string {
+	if len(value) < versionedValueHeaderLen {
+		return value
+	}
+	return value[:versionedValueHeaderLen]
+}
+
+func valueVersionChanged(current string, next string) bool {
+	return valueVersion(current) != valueVersion(next)
+}
+
 func PrintResults(w io.Writer, results []Result) {
 	fmt.Fprintln(w)
-	fmt.Fprintf(w, "%-5s %-10s %-9s %10s %6s %8s %10s %10s %14s %12s %12s %12s %12s\n",
-		"RUN", "TARGET", "OP", "REQUESTS", "CONC", "VALUE", "SUCCESS", "FAILED", "OPS/SEC", "AVG", "P50", "P95", "P99")
-	fmt.Fprintf(w, "%s\n", strings.Repeat("-", 145))
+	fmt.Fprintf(w, "%-5s %-10s %-9s %10s %6s %8s %10s %10s %10s %14s %12s %12s %12s %12s\n",
+		"RUN", "TARGET", "OP", "REQUESTS", "CONC", "VALUE", "LOAD", "SUCCESS", "FAILED", "OPS/SEC", "AVG", "P50", "P95", "P99")
+	fmt.Fprintf(w, "%s\n", strings.Repeat("-", 156))
 
 	for _, r := range results {
-		fmt.Fprintf(w, "%-5d %-10s %-9s %10d %6d %8d %10d %10d %14.2f %12s %12s %12s %12s\n",
+		fmt.Fprintf(w, "%-5d %-10s %-9s %10d %6d %8d %10s %10d %10d %14.2f %12s %12s %12s %12s\n",
 			r.Run,
 			r.Target,
 			r.Operation,
 			r.Requests,
 			r.Concurrency,
 			r.ValueSize,
+			formatLoadDuration(r.LoadDuration),
 			r.Success,
 			r.Failed,
 			r.Throughput,
@@ -408,11 +587,12 @@ func BuildSummary(results []Result) []Summary {
 
 	for _, r := range results {
 		key := summaryKey{
-			Target:      r.Target,
-			Operation:   r.Operation,
-			Requests:    r.Requests,
-			Concurrency: r.Concurrency,
-			ValueSize:   r.ValueSize,
+			Target:       r.Target,
+			Operation:    r.Operation,
+			Requests:     r.Requests,
+			Concurrency:  r.Concurrency,
+			ValueSize:    r.ValueSize,
+			LoadDuration: r.LoadDuration,
 		}
 		if _, ok := groups[key]; !ok {
 			keys = append(keys, key)
@@ -433,11 +613,12 @@ func BuildSummary(results []Result) []Summary {
 }
 
 type summaryKey struct {
-	Target      Target
-	Operation   Operation
-	Requests    int
-	Concurrency int
-	ValueSize   int
+	Target       Target
+	Operation    Operation
+	Requests     int
+	Concurrency  int
+	ValueSize    int
+	LoadDuration time.Duration
 }
 
 func (k summaryKey) less(other summaryKey) bool {
@@ -453,17 +634,21 @@ func (k summaryKey) less(other summaryKey) bool {
 	if k.Concurrency != other.Concurrency {
 		return k.Concurrency < other.Concurrency
 	}
-	return k.ValueSize < other.ValueSize
+	if k.ValueSize != other.ValueSize {
+		return k.ValueSize < other.ValueSize
+	}
+	return k.LoadDuration < other.LoadDuration
 }
 
 func summarizeGroup(key summaryKey, results []Result) Summary {
 	if len(results) == 0 {
 		return Summary{
-			Target:      key.Target,
-			Operation:   key.Operation,
-			Requests:    key.Requests,
-			Concurrency: key.Concurrency,
-			ValueSize:   key.ValueSize,
+			Target:       key.Target,
+			Operation:    key.Operation,
+			Requests:     key.Requests,
+			Concurrency:  key.Concurrency,
+			ValueSize:    key.ValueSize,
+			LoadDuration: key.LoadDuration,
 		}
 	}
 
@@ -473,6 +658,7 @@ func summarizeGroup(key summaryKey, results []Result) Summary {
 		Requests:      key.Requests,
 		Concurrency:   key.Concurrency,
 		ValueSize:     key.ValueSize,
+		LoadDuration:  key.LoadDuration,
 		Runs:          len(results),
 		DurationMin:   results[0].Duration,
 		DurationMax:   results[0].Duration,
@@ -546,17 +732,18 @@ func PrintSummary(w io.Writer, summaries []Summary) {
 
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "SUMMARY")
-	fmt.Fprintf(w, "%-10s %-9s %10s %6s %8s %5s %12s %12s %12s %12s %12s %12s %12s\n",
-		"TARGET", "OP", "REQUESTS", "CONC", "VALUE", "RUNS", "OPS_AVG", "OPS_MIN", "OPS_MAX", "AVG_LAT", "AVG_MIN", "AVG_MAX", "P99_AVG")
-	fmt.Fprintf(w, "%s\n", strings.Repeat("-", 155))
+	fmt.Fprintf(w, "%-10s %-9s %10s %6s %8s %10s %5s %12s %12s %12s %12s %12s %12s %12s\n",
+		"TARGET", "OP", "REQUESTS", "CONC", "VALUE", "LOAD", "RUNS", "OPS_AVG", "OPS_MIN", "OPS_MAX", "AVG_LAT", "AVG_MIN", "AVG_MAX", "P99_AVG")
+	fmt.Fprintf(w, "%s\n", strings.Repeat("-", 166))
 
 	for _, s := range summaries {
-		fmt.Fprintf(w, "%-10s %-9s %10d %6d %8d %5d %12.2f %12.2f %12.2f %12s %12s %12s %12s\n",
+		fmt.Fprintf(w, "%-10s %-9s %10d %6d %8d %10s %5d %12.2f %12.2f %12.2f %12s %12s %12s %12s\n",
 			s.Target,
 			s.Operation,
 			s.Requests,
 			s.Concurrency,
 			s.ValueSize,
+			formatLoadDuration(s.LoadDuration),
 			s.Runs,
 			s.ThroughputAvg,
 			s.ThroughputMin,
@@ -600,7 +787,7 @@ func writeResultsOnlyCSV(w io.Writer, results []Result) error {
 	defer cw.Flush()
 
 	header := []string{
-		"run", "target", "operation", "requests", "concurrency", "value_size", "success", "failed",
+		"run", "target", "operation", "requests", "concurrency", "value_size", "load_duration_sec", "success", "failed",
 		"duration_sec", "throughput_ops_sec", "avg_latency_ms", "min_latency_ms",
 		"max_latency_ms", "p50_latency_ms", "p95_latency_ms", "p99_latency_ms",
 	}
@@ -616,6 +803,7 @@ func writeResultsOnlyCSV(w io.Writer, results []Result) error {
 			fmt.Sprintf("%d", r.Requests),
 			fmt.Sprintf("%d", r.Concurrency),
 			fmt.Sprintf("%d", r.ValueSize),
+			fmt.Sprintf("%.6f", r.LoadDuration.Seconds()),
 			fmt.Sprintf("%d", r.Success),
 			fmt.Sprintf("%d", r.Failed),
 			fmt.Sprintf("%.6f", r.Duration.Seconds()),
@@ -640,7 +828,7 @@ func writeCSV(w io.Writer, results []Result, summaries []Summary) error {
 	defer cw.Flush()
 
 	header := []string{
-		"record_type", "run", "target", "operation", "requests", "concurrency", "value_size", "runs",
+		"record_type", "run", "target", "operation", "requests", "concurrency", "value_size", "load_duration_sec", "runs",
 		"success", "failed", "success_total", "failed_total",
 		"duration_sec", "duration_avg_sec", "duration_min_sec", "duration_max_sec",
 		"throughput_ops_sec", "throughput_avg_ops_sec", "throughput_min_ops_sec", "throughput_max_ops_sec",
@@ -661,6 +849,7 @@ func writeCSV(w io.Writer, results []Result, summaries []Summary) error {
 			fmt.Sprintf("%d", r.Requests),
 			fmt.Sprintf("%d", r.Concurrency),
 			fmt.Sprintf("%d", r.ValueSize),
+			fmt.Sprintf("%.6f", r.LoadDuration.Seconds()),
 			"",
 			fmt.Sprintf("%d", r.Success),
 			fmt.Sprintf("%d", r.Failed),
@@ -703,6 +892,7 @@ func writeCSV(w io.Writer, results []Result, summaries []Summary) error {
 			fmt.Sprintf("%d", s.Requests),
 			fmt.Sprintf("%d", s.Concurrency),
 			fmt.Sprintf("%d", s.ValueSize),
+			fmt.Sprintf("%.6f", s.LoadDuration.Seconds()),
 			fmt.Sprintf("%d", s.Runs),
 			"",
 			"",
@@ -747,6 +937,13 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%.2fµs", float64(d.Nanoseconds())/1000.0)
 	}
 	return fmt.Sprintf("%.2fms", durationMillis(d))
+}
+
+func formatLoadDuration(d time.Duration) string {
+	if d <= 0 {
+		return "-"
+	}
+	return d.String()
 }
 
 func durationMillis(d time.Duration) float64 {

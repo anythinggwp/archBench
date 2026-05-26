@@ -115,8 +115,12 @@ TARANTOOL_CPU_LIMIT="${TARANTOOL_CPU_LIMIT:-1.0}"
 TARANTOOL_ROUTER_CPU_LIMIT="${TARANTOOL_ROUTER_CPU_LIMIT:-2.0}"
 TARANTOOL_BALANCER_CPU_LIMIT="${TARANTOOL_BALANCER_CPU_LIMIT:-1.0}"
 TARANTOOL_STORAGE_CPU_LIMIT="${TARANTOOL_STORAGE_CPU_LIMIT:-${TARANTOOL_CPU_LIMIT}}"
-TARANTOOL_MEMORY_LIMIT="${TARANTOOL_MEMORY_LIMIT:-5G}"
-TARANTOOL_BALANCER_MEMORY_LIMIT="${TARANTOOL_BALANCER_MEMORY_LIMIT:-512M}"
+CONTAINER_MEMORY_LIMIT="${CONTAINER_MEMORY_LIMIT:-1G}"
+TARANTOOL_MEMORY_LIMIT="${TARANTOOL_MEMORY_LIMIT:-${CONTAINER_MEMORY_LIMIT}}"
+TARANTOOL_BALANCER_MEMORY_LIMIT="${TARANTOOL_BALANCER_MEMORY_LIMIT:-${CONTAINER_MEMORY_LIMIT}}"
+DISK_LIMIT_DEVICE="${DISK_LIMIT_DEVICE:-/dev/sda}"
+DISK_READ_BPS="${DISK_READ_BPS:-20mb}"
+DISK_WRITE_BPS="${DISK_WRITE_BPS:-10mb}"
 
 NETWORK_NAME="${NETWORK_NAME:-db-net}"
 KEEP_DATA="${KEEP_DATA:-0}"
@@ -818,6 +822,14 @@ EOF
     networks:
       - ${NETWORK_NAME}
     restart: unless-stopped
+    mem_limit: ${CONTAINER_MEMORY_LIMIT}
+    blkio_config:
+      device_read_bps:
+        - path: ${DISK_LIMIT_DEVICE}
+          rate: ${DISK_READ_BPS}
+      device_write_bps:
+        - path: ${DISK_LIMIT_DEVICE}
+          rate: ${DISK_WRITE_BPS}
     healthcheck:
       test:
         - CMD-SHELL
@@ -863,6 +875,14 @@ EOF
     networks:
       - ${NETWORK_NAME}
     restart: unless-stopped
+    mem_limit: ${CONTAINER_MEMORY_LIMIT}
+    blkio_config:
+      device_read_bps:
+        - path: ${DISK_LIMIT_DEVICE}
+          rate: ${DISK_READ_BPS}
+      device_write_bps:
+        - path: ${DISK_LIMIT_DEVICE}
+          rate: ${DISK_WRITE_BPS}
     healthcheck:
       test:
         - CMD-SHELL
@@ -926,6 +946,14 @@ EOF
     networks:
       - ${NETWORK_NAME}
     restart: unless-stopped
+    mem_limit: ${CONTAINER_MEMORY_LIMIT}
+    blkio_config:
+      device_read_bps:
+        - path: ${DISK_LIMIT_DEVICE}
+          rate: ${DISK_READ_BPS}
+      device_write_bps:
+        - path: ${DISK_LIMIT_DEVICE}
+          rate: ${DISK_WRITE_BPS}
     healthcheck:
       test:
         - CMD-SHELL
@@ -1435,6 +1463,8 @@ Client endpoint:
 Routers:
   host addrs: $(router_host_ports_csv)
   cpu each: ${TARANTOOL_ROUTER_CPU_LIMIT}
+  memory each: ${CONTAINER_MEMORY_LIMIT}
+  disk read/write: ${DISK_READ_BPS}/${DISK_WRITE_BPS} on ${DISK_LIMIT_DEVICE}
 EOF
 
     local router

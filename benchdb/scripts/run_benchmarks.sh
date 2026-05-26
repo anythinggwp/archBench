@@ -15,6 +15,11 @@ set -euo pipefail
 #   SCENARIO_GROUP=scaling \
 #   ./scripts/run_benchmarks.sh
 #
+#   TARGET=tarantool \
+#   TARANTOOL_MODE=cluster \
+#   TARANTOOL_ADDRS=127.0.0.1:3301,127.0.0.1:3302,127.0.0.1:3303 \
+#   ./scripts/run_benchmarks.sh
+#
 # Scenario groups:
 #
 #   smoke
@@ -22,16 +27,21 @@ set -euo pipefail
 #   scaling
 #   read
 #   write
+#   versioned
 #   full
 #
 # Main variables:
 #
 #   DBBENCH_BIN              path to benchmark binary; default: ./dbbench
-#   SCENARIO_GROUP           smoke|standard|scaling|read|write|full; default: standard
+#   SCENARIO_GROUP           smoke|standard|scaling|read|write|versioned|full; default: standard
 #   TARGET                   redis|tarantool|ydb|postgres|all; default: all
 #   RUNS                     repeated runs per test config; default: 3
 #   RUN_DELAY                delay between runs; default: 1s
 #   CLEANUP_BETWEEN_RUNS     1 to add --cleanup-between-runs; default: 0
+#   SET_MODE                 plain|versioned; default: plain
+#   VERSIONED_SET_KEYS       keyspace size for versioned SET; default: 1000
+#   VERSIONED_SET_CHANGE_EVERY repeated writes per key before version changes; default: 5
+#   VERSIONED_TARGETS        targets for versioned scenario; default: redis,tarantool
 #
 # Redis variables:
 #
@@ -44,11 +54,11 @@ set -euo pipefail
 # Tarantool variables:
 #
 #   TARANTOOL_ADDR           default: 127.0.0.1:3301
-#   TARANTOOL_ADDRS          comma-separated router addresses; overrides TARANTOOL_ADDR when set
+#   TARANTOOL_ADDRS          comma-separated addresses; in cluster mode keys are routed by hash
 #   TARANTOOL_USER           default: app
 #   TARANTOOL_PASSWORD       default: app_pass
 #   TARANTOOL_SPACE          default: kv
-#   TARANTOOL_MODE           direct, call, vshard or crud; default: direct
+#   TARANTOOL_MODE           direct, cluster, call, vshard or crud; default: direct
 #   TARANTOOL_MAX_CONNS      client connections; 0 means benchmark concurrency
 #   TARANTOOL_NO_DDL         1 to add --tarantool-no-ddl; default: 1
 #
@@ -76,6 +86,16 @@ TARGET="${TARGET:-all}"
 RUNS="${RUNS:-3}"
 RUN_DELAY="${RUN_DELAY:-1s}"
 CLEANUP_BETWEEN_RUNS="${CLEANUP_BETWEEN_RUNS:-1}"
+SET_MODE="${SET_MODE:-plain}"
+VERSIONED_SET_KEYS="${VERSIONED_SET_KEYS:-1000}"
+VERSIONED_SET_CHANGE_EVERY="${VERSIONED_SET_CHANGE_EVERY:-5}"
+if [[ -z "${VERSIONED_TARGETS+x}" ]]; then
+  if [[ "$TARGET" == "all" ]]; then
+    VERSIONED_TARGETS="redis,tarantool"
+  else
+    VERSIONED_TARGETS="$TARGET"
+  fi
+fi
 
 RESULTS_DIR="${RESULTS_DIR:-results/$(date '+%Y%m%d-%H%M%S')}"
 
@@ -163,6 +183,9 @@ build_common_flags() {
 
     --runs "$RUNS"
     --run-delay "$RUN_DELAY"
+    --set-mode "$SET_MODE"
+    --versioned-set-keys "$VERSIONED_SET_KEYS"
+    --versioned-set-change-every "$VERSIONED_SET_CHANGE_EVERY"
     --summary
     --file-format csv
   )
@@ -206,6 +229,10 @@ target=$TARGET
 runs=$RUNS
 run_delay=$RUN_DELAY
 cleanup_between_runs=$CLEANUP_BETWEEN_RUNS
+set_mode=$SET_MODE
+versioned_set_keys=$VERSIONED_SET_KEYS
+versioned_set_change_every=$VERSIONED_SET_CHANGE_EVERY
+versioned_targets=$VERSIONED_TARGETS
 
 redis_mode=$REDIS_MODE
 redis_addr=$REDIS_ADDR
@@ -246,6 +273,7 @@ run_scenario() {
   echo "Target:          $TARGET"
   echo "Redis mode:      $REDIS_MODE"
   echo "Tarantool addrs: ${TARANTOOL_ADDRS:-$TARANTOOL_ADDR}"
+  echo "Set mode:        $SET_MODE"
   echo "Output:          $output_file"
   echo "Log:             $log_file"
   echo "============================================================"
@@ -373,6 +401,28 @@ run_write() {
     --value-size-list 64,128,512,1024,4096
 }
 
+run_versioned() {
+  run_scenario "40_versioned_set_if_changed" \
+    --target "$VERSIONED_TARGETS" \
+    --operation set \
+    --requests 100000 \
+    --concurrency 64 \
+    --value-size 128 \
+    --set-mode versioned \
+    --versioned-set-keys "$VERSIONED_SET_KEYS" \
+    --versioned-set-change-every "$VERSIONED_SET_CHANGE_EVERY"
+
+  run_scenario "41_versioned_set_concurrency_scaling" \
+    --target "$VERSIONED_TARGETS" \
+    --operation set \
+    --requests 100000 \
+    --concurrency-list 1,2,4,8,16,32,64,128,256,512 \
+    --value-size 128 \
+    --set-mode versioned \
+    --versioned-set-keys "$VERSIONED_SET_KEYS" \
+    --versioned-set-change-every "$VERSIONED_SET_CHANGE_EVERY"
+}
+
 main() {
   normalize_values
   require_binary
@@ -384,6 +434,7 @@ main() {
   echo "Target:            $TARGET"
   echo "Redis mode:        $REDIS_MODE"
   echo "Tarantool addrs:   ${TARANTOOL_ADDRS:-$TARANTOOL_ADDR}"
+  echo "Set mode:          $SET_MODE"
 
   if [[ "$REDIS_MODE" == "cluster" ]]; then
     echo "Redis cluster:     $REDIS_CLUSTER_ADDRS"
@@ -414,17 +465,22 @@ main() {
       run_write
       ;;
 
+    versioned)
+      run_versioned
+      ;;
+
     full)
       run_smoke
       run_standard
       run_scaling
       run_read
       run_write
+      run_versioned
       ;;
 
     *)
       echo "Unknown SCENARIO_GROUP: $SCENARIO_GROUP" >&2
-      echo "Allowed values: smoke, standard, scaling, read, write, full" >&2
+      echo "Allowed values: smoke, standard, scaling, read, write, versioned, full" >&2
       exit 1
       ;;
   esac
