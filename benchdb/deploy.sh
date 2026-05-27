@@ -7,7 +7,7 @@ DEPLOY_TARGETS="${DEPLOY_TARGETS:-redis,tarantool}"
 
 normalize_targets() {
     if [[ "$DEPLOY_TARGETS" == "all" ]]; then
-        DEPLOY_TARGETS="redis,tarantool,postgres,ydb"
+        DEPLOY_TARGETS="redis,tarantool,postgres,citus,ydb"
     fi
 
     DEPLOY_TARGETS="$(echo "$DEPLOY_TARGETS" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
@@ -25,6 +25,9 @@ run_target() {
             ;;
         postgres)
             "$SCRIPT_DIR/deploy_postgres.sh" "$ACTION"
+            ;;
+        citus|postgres-citus|postgres_citus)
+            "$SCRIPT_DIR/deploy_postgres_citus.sh" "$ACTION"
             ;;
         ydb)
             "$SCRIPT_DIR/deploy_ydb_container.sh" "$ACTION"
